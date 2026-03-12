@@ -1,0 +1,30 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+.venv_eccomas_sensor/
+
+# Logs
+*.log
+pipeline.log
+
+# Training outputs and caches
+eccomas_sensor_pipeline/outputs/
+eccomas_sensor_pipeline/.plot_cache/
+mach_experts/results/
+
+# Large datasets
+data/*.npy
+data_cut_y12/*.npy
+
+# Optional local artifacts
+*.pth
+*.bin

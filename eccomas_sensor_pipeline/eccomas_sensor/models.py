@@ -39,26 +39,43 @@ class CpExpertNet(nn.Module):
 
 
 class LatentGateNet(nn.Module):
-    def __init__(self, gate_input_dim: int, latent_dim: int, n_experts: int):
+    def __init__(
+        self,
+        gate_input_dim: int,
+        latent_dim: int,
+        n_experts: int,
+        backbone_dim: int = 128,
+        gating_hidden_dim: int = 128,
+        dropout: float = 0.05,
+    ):
         super().__init__()
+        self.backbone = nn.Sequential(
+            nn.Linear(gate_input_dim, backbone_dim),
+            nn.LayerNorm(backbone_dim),
+            nn.SiLU(),
+            nn.Linear(backbone_dim, backbone_dim),
+            nn.LayerNorm(backbone_dim),
+            nn.SiLU(),
+        )
         self.encoder = nn.Sequential(
-            nn.Linear(gate_input_dim, 64),
-            nn.LayerNorm(64),
+            nn.Linear(backbone_dim, backbone_dim // 2),
             nn.SiLU(),
-            nn.Linear(64, 64),
-            nn.LayerNorm(64),
-            nn.SiLU(),
-            nn.Linear(64, latent_dim),
+            nn.Linear(backbone_dim // 2, latent_dim),
         )
         self.gating = nn.Sequential(
-            nn.Linear(latent_dim, 64),
+            nn.Linear(backbone_dim + latent_dim, gating_hidden_dim),
+            nn.LayerNorm(gating_hidden_dim),
             nn.SiLU(),
-            nn.Linear(64, n_experts),
+            nn.Dropout(dropout),
+            nn.Linear(gating_hidden_dim, gating_hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(gating_hidden_dim // 2, n_experts),
         )
 
     def forward(self, gate_features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        z = self.encoder(gate_features)
-        logits = self.gating(z)
+        hidden = self.backbone(gate_features)
+        z = self.encoder(hidden)
+        logits = self.gating(torch.cat([hidden, z], dim=1))
         gates = F.softmax(logits, dim=1)
         return z, logits, gates
 
@@ -76,9 +93,25 @@ class LatentSensorMoE(nn.Module):
                 param.requires_grad = False
             expert.eval()
 
-    def forward(self, expert_features: torch.Tensor, gate_features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        z, logits, gates = self.gate_net(gate_features)
+    def train(self, mode: bool = True):
+        super().train(mode)
+        for expert in self.experts:
+            expert.eval()
+        return self
+
+    def expert_stack(self, expert_features: torch.Tensor) -> torch.Tensor:
         expert_outputs = [expert(expert_features) for expert in self.experts]
-        stacked = torch.stack(expert_outputs, dim=2)
+        return torch.stack(expert_outputs, dim=2)
+
+    def forward(
+        self,
+        expert_features: torch.Tensor,
+        gate_features: torch.Tensor,
+        return_expert_stack: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        z, logits, gates = self.gate_net(gate_features)
+        stacked = self.expert_stack(expert_features)
         mixed = (stacked * gates.unsqueeze(1)).sum(dim=2)
+        if return_expert_stack:
+            return mixed, z, logits, gates, stacked
         return mixed, z, logits, gates

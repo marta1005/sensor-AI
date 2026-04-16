@@ -7,13 +7,14 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .config import PipelineConfig
-from .datasets import IndexedCpDataset
+from .datasets import IndexedCpDataset, WeightedIndexedCpDataset
 from .models import CpExpertNet
 
 _PLOT_CACHE = Path(__file__).resolve().parents[1] / ".plot_cache"
@@ -57,19 +58,65 @@ def _evaluate(model: CpExpertNet, loader: DataLoader, device: torch.device) -> d
     }
 
 
+def _weighted_smooth_l1(pred: torch.Tensor, target: torch.Tensor, weights: torch.Tensor, beta: float = 1.0) -> torch.Tensor:
+    per_row = F.smooth_l1_loss(pred, target, beta=beta, reduction="none").mean(dim=1)
+    weighted = per_row * weights
+    return weighted.sum() / weights.sum().clamp_min(1e-8)
+
+
+def _regime_sample_weights(mach: np.ndarray, cfg: PipelineConfig, regime_id: int) -> np.ndarray:
+    mach = np.asarray(mach, dtype=np.float32)
+    weights = np.zeros_like(mach, dtype=np.float32)
+    margin = float(cfg.expert_overlap_margin)
+    floor = float(cfg.expert_overlap_min_weight)
+
+    if regime_id == 0:
+        core = mach <= cfg.mach_sub_max
+        weights[core] = 1.0
+        if margin > 0.0:
+            overlap = (mach > cfg.mach_sub_max) & (mach <= cfg.mach_sub_max + margin)
+            frac = (mach[overlap] - cfg.mach_sub_max) / margin
+            weights[overlap] = 1.0 - (1.0 - floor) * frac
+    elif regime_id == 1:
+        core = (mach >= cfg.mach_sub_max) & (mach <= cfg.mach_trans_max)
+        weights[core] = 1.0
+        if margin > 0.0:
+            lower = (mach >= cfg.mach_sub_max - margin) & (mach < cfg.mach_sub_max)
+            lower_frac = (mach[lower] - (cfg.mach_sub_max - margin)) / margin
+            weights[lower] = floor + (1.0 - floor) * lower_frac
+
+            upper = (mach > cfg.mach_trans_max) & (mach <= cfg.mach_trans_max + margin)
+            upper_frac = 1.0 - (mach[upper] - cfg.mach_trans_max) / margin
+            weights[upper] = floor + (1.0 - floor) * upper_frac
+    else:
+        core = mach >= cfg.mach_trans_max
+        weights[core] = 1.0
+        if margin > 0.0:
+            overlap = (mach >= cfg.mach_trans_max - margin) & (mach < cfg.mach_trans_max)
+            frac = (cfg.mach_trans_max - mach[overlap]) / margin
+            weights[overlap] = 1.0 - (1.0 - floor) * frac
+
+    return weights.astype(np.float32)
+
+
 def _train_single_regime(cfg: PipelineConfig, regime_id: int, regime_name: str) -> None:
     train_x_path, train_cp_path, train_id_path = _feature_paths(cfg, "train")
     test_x_path, test_cp_path, test_id_path = _feature_paths(cfg, "test")
+    train_raw_path = cfg.cut_data_dir / "X_cut_train.npy"
 
     train_ids = np.load(train_id_path, mmap_mode="r")
     test_ids = np.load(test_id_path, mmap_mode="r")
-    train_idx = np.flatnonzero(np.asarray(train_ids) == regime_id)
+    train_raw = np.load(train_raw_path, mmap_mode="r")
+    train_mach = np.asarray(train_raw[:, 6], dtype=np.float32)
+    train_weights_full = _regime_sample_weights(train_mach, cfg, regime_id)
+    train_idx = np.flatnonzero(train_weights_full > 0.0)
+    train_weights = train_weights_full[train_idx]
     test_idx = np.flatnonzero(np.asarray(test_ids) == regime_id)
 
     if train_idx.size == 0:
         raise ValueError(f"No train samples for regime {regime_name}")
 
-    train_set = IndexedCpDataset(str(train_x_path), str(train_cp_path), train_idx)
+    train_set = WeightedIndexedCpDataset(str(train_x_path), str(train_cp_path), train_idx, train_weights)
     test_set = IndexedCpDataset(str(test_x_path), str(test_cp_path), test_idx if test_idx.size > 0 else None)
 
     train_loader = DataLoader(
@@ -91,7 +138,6 @@ def _train_single_regime(cfg: PipelineConfig, regime_id: int, regime_name: str) 
 
     input_dim = np.load(train_x_path, mmap_mode="r").shape[1]
     model = CpExpertNet(input_dim=input_dim).to(cfg.device)
-    criterion = nn.SmoothL1Loss(beta=1.0)
     optimizer = optim.AdamW(model.parameters(), lr=cfg.expert_lr, weight_decay=cfg.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=cfg.expert_epochs)
 
@@ -103,19 +149,20 @@ def _train_single_regime(cfg: PipelineConfig, regime_id: int, regime_name: str) 
         epoch_loss = 0.0
         n_rows = 0
         pbar = tqdm(train_loader, desc=f"[expert:{regime_name}] epoch {epoch}/{cfg.expert_epochs}")
-        for bx, by in pbar:
+        for bx, by, bw in pbar:
             bx = bx.to(cfg.device, non_blocking=True)
             by = by.to(cfg.device, non_blocking=True)
+            bw = bw.to(cfg.device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             pred = model(bx)
-            loss = criterion(pred, by)
+            loss = _weighted_smooth_l1(pred, by, bw)
             loss.backward()
             optimizer.step()
-            epoch_loss += loss.item() * bx.shape[0]
+            epoch_loss += loss.item() * bw.sum().item()
             n_rows += bx.shape[0]
             pbar.set_postfix(loss=f"{loss.item():.5f}")
         scheduler.step()
-        train_loss = epoch_loss / max(1, n_rows)
+        train_loss = epoch_loss / max(1.0, float(train_weights.sum()))
         test_metrics = _evaluate(model, test_loader, cfg.device)
         history_train.append(train_loss)
         history_test.append(test_metrics["smooth_l1"])
@@ -130,9 +177,12 @@ def _train_single_regime(cfg: PipelineConfig, regime_id: int, regime_name: str) 
     metrics = {
         "regime": regime_name,
         "train_rows": int(train_idx.size),
+        "train_weight_sum": float(train_weights.sum()),
         "test_rows": int(test_idx.size),
         "final_train_smooth_l1": float(history_train[-1]),
         "final_test_smooth_l1": float(history_test[-1]),
+        "overlap_margin": float(cfg.expert_overlap_margin),
+        "overlap_min_weight": float(cfg.expert_overlap_min_weight),
     }
     with (cfg.metrics_dir / f"expert_{regime_name}.json").open("w", encoding="utf-8") as handle:
         json.dump(metrics, handle, indent=2)

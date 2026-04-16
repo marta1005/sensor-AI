@@ -1,0 +1,66 @@
+# Eccomas Full Aircraft
+
+Línea nueva para trabajar con el dataset ONERA completo usando una representación reducida de superficie, sin tocar el pipeline actual de `eccomas_sensor_pipeline`.
+
+## Objetivo
+
+Pasar de `260,774` puntos raw por condición a una superficie simplificada y reutilizable, y a partir de ahí montar una pipeline completa:
+
+1. preparar la referencia de superficie
+2. extraer arrays reducidos por condición
+3. construir features
+4. entrenar expertos
+5. entrenar el teacher latent/MoE
+6. destilar el sensor simbólico
+7. hacer inferencia
+
+## Comandos
+
+```bash
+source .venv/bin/activate
+
+python eccomas_full_aircrafts/main.py inspect-raw
+
+python eccomas_full_aircrafts/main.py prepare-reference-surface \
+  --reference-split train \
+  --reference-condition-index 0 \
+  --x-bins 1080 \
+  --y-bins 540
+
+python eccomas_full_aircrafts/main.py prepare-reduced-data \
+  --surface upper
+
+python eccomas_full_aircrafts/main.py prepare-features
+
+python eccomas_full_aircrafts/main.py train-experts
+
+python eccomas_full_aircrafts/main.py train-latent
+
+python eccomas_full_aircrafts/main.py distill-sensor
+
+python eccomas_full_aircrafts/main.py infer \
+  --mode symbolic
+```
+
+## Qué queda guardado
+
+- `outputs/surfaces/`
+  Referencia simplificada `upper/lower`
+- `outputs/reduced_data/`
+  Arrays reducidos `X_cut_*.npy`, `Y_cut_*.npy`
+- `outputs/features/`
+  Features estandarizadas para expertos y gate
+- `outputs/models/`
+  Expertos y `latent_sensor_moe.pth`
+- `outputs/sensor/`
+  Sensor simbólico híbrido
+- `outputs/inference/`
+  Predicciones `neural` o `symbolic`
+- `results/`
+  Figuras de referencia y `Cp fields` raw
+
+## Notas
+
+- La ruta de entrenamiento actual está pensada para una sola cara de referencia cada vez. El default es `upper`.
+- `plot-raw-fields` ya soporta `points` y `surface`, pero la visualización principal recomendada sigue siendo `points`.
+- `mach_experts` sigue sin estar conectado a esta línea.

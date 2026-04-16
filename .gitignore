@@ -18,7 +18,12 @@ pipeline.log
 
 # Training outputs and caches
 eccomas_sensor_pipeline/outputs/
+eccomas_sensor_pipeline/results/
 eccomas_sensor_pipeline/.plot_cache/
+eccomas_full_aircrafts/outputs/
+eccomas_full_aircrafts/results/
+eccomas_full_aircrafts/.plot_cache/
+eccomas_full_aircrafts/pipeline/.plot_cache/
 mach_experts/results/
 
 # Large datasets

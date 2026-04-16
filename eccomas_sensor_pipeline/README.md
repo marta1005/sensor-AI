@@ -7,7 +7,8 @@ Pipeline ordenado para:
 3. entrenar expertos de `Cp` por regimen de Mach
 4. entrenar un encoder latente + gating
 5. visualizar siempre el espacio latente
-6. destilar el encoder a ecuaciones simbolicas
+6. destilar el sensor de routing a ecuaciones simbolicas
+7. ejecutar inferencia de `Cp` desde `X` crudo
 
 ## Estructura
 
@@ -20,7 +21,8 @@ Pipeline ordenado para:
 - `eccomas_sensor/train_experts.py`: entrenamiento de expertos
 - `eccomas_sensor/train_latent.py`: entrenamiento del encoder/gating y export del latente
 - `eccomas_sensor/latent_viz.py`: plots del espacio latente
-- `eccomas_sensor/symbolic_distillation.py`: regresores simbolicos para aproximar `z`
+- `eccomas_sensor/sensor_distillation.py`: regresores simbolicos para aproximar el routing del sensor
+- `eccomas_sensor/inference.py`: inferencia `X -> sensor -> mezcla de expertos -> Cp`
 
 ## Flujo recomendado
 
@@ -29,7 +31,7 @@ python eccomas_sensor_pipeline/main.py prepare-data
 python eccomas_sensor_pipeline/main.py prepare-features
 python eccomas_sensor_pipeline/main.py train-experts
 python eccomas_sensor_pipeline/main.py train-latent
-python eccomas_sensor_pipeline/main.py distill-symbolic
+python eccomas_sensor_pipeline/main.py distill-sensor
 ```
 
 Tambien existe:
@@ -65,3 +67,29 @@ El encoder y el sensor simbolico solo usan variables disponibles en inferencia. 
 - Features de encoder: mas compactas y fisicas, para que luego gplearn pueda aproximar bien el latente.
 
 El espacio latente se fuerza a 3D para poder visualizarlo siempre con proyecciones 2D y vistas 3D.
+
+## Inferencia
+
+Modo neuronal completo:
+
+```bash
+python eccomas_sensor_pipeline/main.py infer \
+  --input-path /ruta/a/X.npy \
+  --mode neural
+```
+
+Modo con sensor simbolico destilado:
+
+```bash
+python eccomas_sensor_pipeline/main.py infer \
+  --input-path /ruta/a/X.npy \
+  --mode symbolic
+```
+
+Por defecto, los resultados se guardan en `eccomas_sensor_pipeline/outputs/inference/` e incluyen:
+
+- `cp_pred`: prediccion final de `Cp`
+- `gates`: pesos del routing
+- `expert_id`: experto dominante por fila
+- `sensor_scores`: scores previos al softmax del sensor
+- `z`: solo en modo `neural`

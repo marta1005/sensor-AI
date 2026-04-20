@@ -93,6 +93,15 @@ def build_parser() -> argparse.ArgumentParser:
     field_parser.add_argument("--condition-indices", type=int, nargs="*", default=None)
     field_parser.add_argument("--max-plotted-points", type=int, default=60_000)
 
+    eval_parser = subparsers.add_parser(
+        "plot-eval-cp",
+        parents=[common],
+        help="Plot full-aircraft raw Cp in the eval_score_plot_fields.py top/bottom style",
+    )
+    eval_parser.add_argument("--split", type=str, choices=["train", "test"], default="test")
+    eval_parser.add_argument("--condition-indices", type=int, nargs="*", default=None)
+    eval_parser.add_argument("--max-plotted-points", type=int, default=120_000)
+
     return parser
 
 
@@ -175,6 +184,15 @@ def main() -> None:
             surface=args.surface,
             max_plotted_points=args.max_plotted_points,
             mode=args.mode,
+        )
+    elif args.command == "plot-eval-cp":
+        from eccomas_full_aircrafts.pipeline.plot_fields import generate_eval_cp_plots
+
+        generate_eval_cp_plots(
+            cfg,
+            split=args.split,
+            condition_indices=args.condition_indices,
+            max_plotted_points=args.max_plotted_points,
         )
     else:
         parser.error(f"Unsupported command: {args.command}")

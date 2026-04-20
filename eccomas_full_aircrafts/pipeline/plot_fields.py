@@ -15,6 +15,7 @@ os.environ.setdefault("MPLCONFIGDIR", str(_PLOT_CACHE / "mpl"))
 os.environ.setdefault("XDG_CACHE_HOME", str(_PLOT_CACHE / "xdg"))
 
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 
 
 def _reference_surface_path(cfg: FullAircraftConfig, surface: str) -> Path:
@@ -136,4 +137,143 @@ def generate_raw_cp_field_plots(
         "results": summary,
     }
     save_json(result_dir / f"cp_full_aircraft_{surface}_{mode}_{split}_summary.json", payload)
+    return payload
+
+
+def _eval_tb_cp_figure(
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
+    cp: np.ndarray,
+    rec: dict[str, float],
+    title_prefix: str,
+    out_path: Path,
+) -> None:
+    camera_settings = {
+        "elevation": 90.0,
+        "azimuth": 0.0,
+        "zoom": 1.9,
+        "xoffsets": [0.0, 0.0],
+        "yoffsets": [0.0, 4.0],
+        "zoffsets": [0.0, 0.0],
+    }
+    cp_min = float(np.min(cp))
+    cp_max = float(np.max(cp))
+
+    xmin, xmax = float(np.min(x)), float(np.max(x))
+    ymin, ymax = float(np.min(y)), float(np.max(y))
+    zmin, zmax = float(np.min(z)), float(np.max(z))
+
+    fig = plt.figure(figsize=(4.4, 4.6))
+    gs = gridspec.GridSpec(nrows=2, ncols=1, height_ratios=[20, 1], hspace=0.06)
+    gs_views = gridspec.GridSpecFromSubplotSpec(1, 2, subplot_spec=gs[0], wspace=0.0)
+
+    scatter = None
+    for j in range(2):
+        ax = fig.add_subplot(gs_views[0, j], projection="3d")
+        scatter = ax.scatter3D(
+            x,
+            y,
+            z,
+            c=cp,
+            s=1.0,
+            cmap="jet",
+            vmin=cp_min,
+            vmax=cp_max,
+            linewidths=0,
+            clip_on=False,
+        )
+        ax.view_init(
+            elev=camera_settings["elevation"] * ((-1) ** (j + 1)),
+            azim=camera_settings["azimuth"] + 180 * abs(j - 1),
+        )
+        ax.set(
+            xlim=(xmin + camera_settings["xoffsets"][0], xmax + camera_settings["xoffsets"][1]),
+            ylim=(ymin + camera_settings["yoffsets"][0], ymax + camera_settings["yoffsets"][1]),
+            zlim=(zmin + camera_settings["zoffsets"][0], zmax + camera_settings["zoffsets"][1]),
+        )
+        ax.set_axis_off()
+        limits = np.array([getattr(ax, f"get_{axis}lim")() for axis in "xyz"])
+        ax.set_box_aspect(np.ptp(limits, axis=1), zoom=camera_settings["zoom"])
+        if j == 0:
+            ax.text((xmax - xmin) / 4 + 0.5, (ymax - ymin) / 2 + 7.0, 0.0, "bottom", fontsize=6)
+        else:
+            ax.text((xmax - xmin) / 4, (ymax - ymin) / 2 - 5.0, 0.0, "top", fontsize=6)
+
+    cax = fig.add_subplot(gs[1])
+    cbar = fig.colorbar(scatter, cax=cax, orientation="horizontal")
+    cbar.set_label("$C_p$", size=8)
+    cbar.ax.tick_params(labelsize=6)
+    cbar.ax.xaxis.set_label_position("top")
+
+    fig.suptitle(
+        f"{title_prefix} $p_i$ = {rec['Pi']:.1f} 10⁵, $M_{{\\infty}}$ = {rec['Mach']:.2f}, AoA = {rec['AoA_deg']:.1f}°",
+        fontsize=12,
+    )
+    fig.tight_layout(h_pad=2.0)
+    fig.savefig(out_path, dpi=400, bbox_inches="tight")
+    plt.close(fig)
+
+
+def generate_eval_cp_plots(
+    cfg: FullAircraftConfig,
+    split: str = "test",
+    condition_indices: list[int] | None = None,
+    max_plotted_points: int = 120_000,
+) -> dict:
+    cfg.ensure_dirs()
+    result_dir = cfg.shared_results_dir
+    result_dir.mkdir(parents=True, exist_ok=True)
+
+    x_path, y_path = raw_paths(cfg.raw_data_dir, split)
+    x_raw = np.load(x_path, mmap_mode="r")
+    y_raw = np.load(y_path, mmap_mode="r")
+    n_conditions = int(x_raw.shape[0] // cfg.raw_points_per_condition)
+    condition_indices = list(range(n_conditions)) if condition_indices is None else [int(idx) for idx in condition_indices]
+    records = _condition_records(cfg, split)
+
+    summary: list[dict[str, float | str]] = []
+    for cond_idx in condition_indices:
+        start = condition_start(cfg.raw_points_per_condition, cond_idx)
+        stop = condition_stop(cfg.raw_points_per_condition, cond_idx)
+        x_block = np.asarray(x_raw[start:stop, : cfg.input_dim_raw], dtype=np.float32)
+        cp_block = np.asarray(y_raw[start:stop, cfg.cp_column], dtype=np.float32)
+
+        n_plot = min(max_plotted_points, x_block.shape[0])
+        plot_idx = sample_indices(x_block.shape[0], n_plot, seed=17 + cond_idx)
+        xyz = x_block[plot_idx, 0:3]
+        cp_plot = cp_block[plot_idx]
+
+        rec = records[cond_idx]
+        out_path = result_dir / f"cp_full_aircraft_eval_tb_{split}_cond{cond_idx}.png"
+        _eval_tb_cp_figure(
+            xyz[:, 0],
+            xyz[:, 1],
+            xyz[:, 2],
+            cp_plot,
+            rec,
+            title_prefix="Full-aircraft raw Cp",
+            out_path=out_path,
+        )
+
+        summary.append(
+            {
+                "condition_index": int(cond_idx),
+                "split": split,
+                "Mach": float(rec["Mach"]),
+                "AoA_deg": float(rec["AoA_deg"]),
+                "Pi": float(rec["Pi"]),
+                "points_plotted": int(n_plot),
+                "cp_min": float(cp_block.min()),
+                "cp_max": float(cp_block.max()),
+                "path": str(out_path),
+            }
+        )
+
+    payload = {
+        "split": split,
+        "n_conditions": len(summary),
+        "results": summary,
+    }
+    save_json(result_dir / f"cp_full_aircraft_eval_tb_{split}_summary.json", payload)
     return payload

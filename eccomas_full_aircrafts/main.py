@@ -102,6 +102,47 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument("--condition-indices", type=int, nargs="*", default=None)
     eval_parser.add_argument("--max-plotted-points", type=int, default=120_000)
 
+    infer_plot_parser = subparsers.add_parser(
+        "plot-inference-cp",
+        parents=[common],
+        help="Plot full-aircraft truth/symbolic/error Cp in the eval top/bottom style",
+    )
+    infer_plot_parser.add_argument("--split", type=str, choices=["train", "test"], default="test")
+    infer_plot_parser.add_argument("--condition-indices", type=int, nargs="*", default=None)
+    infer_plot_parser.add_argument("--prediction-path", type=str, default=None, help="Optional .npz prediction file from infer.")
+    infer_plot_parser.add_argument("--max-plotted-points", type=int, default=120_000)
+    infer_plot_parser.add_argument(
+        "--layout",
+        type=str,
+        choices=["truth-pred", "truth-pred-error"],
+        default="truth-pred",
+        help="Choose whether to plot only truth/predicted or also the absolute error panel.",
+    )
+    infer_plot_parser.add_argument(
+        "--view",
+        type=str,
+        choices=["tb", "top"],
+        default="top",
+        help="Choose duplicated top/bottom eval-style views or a single top view.",
+    )
+
+    infer_grid_parser = subparsers.add_parser(
+        "plot-inference-cp-grid",
+        parents=[common],
+        help="Plot several full-aircraft conditions in one truth/predicted/error grid",
+    )
+    infer_grid_parser.add_argument("--split", type=str, choices=["train", "test"], default="test")
+    infer_grid_parser.add_argument("--condition-indices", type=int, nargs="+", required=True)
+    infer_grid_parser.add_argument("--prediction-path", type=str, default=None, help="Optional .npz prediction file from infer.")
+    infer_grid_parser.add_argument("--max-plotted-points", type=int, default=120_000)
+    infer_grid_parser.add_argument(
+        "--view",
+        type=str,
+        choices=["tb", "top"],
+        default="top",
+        help="Choose duplicated top/bottom eval-style views or a single top view.",
+    )
+
     return parser
 
 
@@ -193,6 +234,31 @@ def main() -> None:
             split=args.split,
             condition_indices=args.condition_indices,
             max_plotted_points=args.max_plotted_points,
+        )
+    elif args.command == "plot-inference-cp":
+        from eccomas_full_aircrafts.pipeline.plot_fields import generate_inference_cp_plots
+
+        prediction_path = Path(args.prediction_path).expanduser().resolve() if args.prediction_path else None
+        generate_inference_cp_plots(
+            cfg,
+            split=args.split,
+            condition_indices=args.condition_indices,
+            prediction_path=prediction_path,
+            max_plotted_points=args.max_plotted_points,
+            layout=args.layout,
+            view=args.view,
+        )
+    elif args.command == "plot-inference-cp-grid":
+        from eccomas_full_aircrafts.pipeline.plot_fields import generate_inference_cp_grid_plot
+
+        prediction_path = Path(args.prediction_path).expanduser().resolve() if args.prediction_path else None
+        generate_inference_cp_grid_plot(
+            cfg,
+            split=args.split,
+            condition_indices=args.condition_indices,
+            prediction_path=prediction_path,
+            max_plotted_points=args.max_plotted_points,
+            view=args.view,
         )
     else:
         parser.error(f"Unsupported command: {args.command}")

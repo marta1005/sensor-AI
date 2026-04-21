@@ -10,7 +10,7 @@ import torch
 from eccomas_sensor_pipeline.eccomas_sensor.models import LatentGateNet
 
 from .config import FullAircraftConfig
-from .features import ENCODER_FEATURE_NAMES, build_encoder_features
+from .features import ENCODER_FEATURE_NAMES, SYMBOLIC_GATE_ENCODER_FEATURE_NAMES, SYMBOLIC_GATE_ENCODER_INDICES, build_encoder_features
 from .utils import sample_indices
 
 _PLOT_CACHE = Path(__file__).resolve().parent / ".plot_cache"
@@ -23,8 +23,8 @@ import matplotlib.pyplot as plt
 
 
 REGIME_NAMES = ["subsonic", "transonic", "supersonic"]
-HYBRID_FEATURE_INDICES = [0, 1, 2, 3, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 21]
-HYBRID_FEATURE_NAMES = [ENCODER_FEATURE_NAMES[idx] for idx in HYBRID_FEATURE_INDICES]
+HYBRID_FEATURE_INDICES = SYMBOLIC_GATE_ENCODER_INDICES
+HYBRID_FEATURE_NAMES = SYMBOLIC_GATE_ENCODER_FEATURE_NAMES
 BAND_EXTRA_FEATURE_NAMES = [
     "Mach_ctr",
     "Mach_ctr_sq",
@@ -117,7 +117,12 @@ def _render_linear_equation(intercept: float, coefficients: np.ndarray, basis_na
 
 
 def _load_teacher_gate_net(cfg: FullAircraftConfig) -> LatentGateNet:
-    gate_input_dim = np.load(cfg.features_dir / "gate_features_train.npy", mmap_mode="r").shape[1]
+    gate_config_path = cfg.models_dir / "latent_gate_config.json"
+    if gate_config_path.exists():
+        gate_cfg = json.loads(gate_config_path.read_text())
+        gate_input_dim = int(len(gate_cfg.get("gate_feature_indices", [])))
+    else:
+        gate_input_dim = np.load(cfg.features_dir / "gate_features_train.npy", mmap_mode="r").shape[1]
     gate_net = LatentGateNet(gate_input_dim=gate_input_dim, latent_dim=cfg.latent_dim, n_experts=cfg.n_experts)
 
     state = torch.load(cfg.models_dir / "latent_sensor_moe.pth", map_location="cpu")
@@ -144,6 +149,12 @@ def _teacher_outputs(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     gate_features = np.load(cfg.features_dir / f"gate_features_{split}.npy", mmap_mode="r")
     x_raw = np.load(cfg.cut_data_dir / f"X_cut_{split}.npy", mmap_mode="r")
+    gate_config_path = cfg.models_dir / "latent_gate_config.json"
+    if gate_config_path.exists():
+        gate_cfg = json.loads(gate_config_path.read_text())
+        gate_feature_indices = [int(idx) for idx in gate_cfg.get("gate_feature_indices", [])]
+    else:
+        gate_feature_indices = []
 
     idx = sample_indices(gate_features.shape[0], min(max_samples, int(gate_features.shape[0])), seed=seed)
     teacher_gates = np.zeros((idx.shape[0], cfg.n_experts), dtype=np.float32)
@@ -153,7 +164,10 @@ def _teacher_outputs(
         for start in range(0, idx.shape[0], batch_size):
             end = min(idx.shape[0], start + batch_size)
             batch_idx = idx[start:end]
-            gate_batch = torch.from_numpy(np.asarray(gate_features[batch_idx], dtype=np.float32)).to(cfg.device, non_blocking=True)
+            gate_batch_np = np.asarray(gate_features[batch_idx], dtype=np.float32)
+            if gate_feature_indices:
+                gate_batch_np = gate_batch_np[:, gate_feature_indices]
+            gate_batch = torch.from_numpy(gate_batch_np).to(cfg.device, non_blocking=True)
             _, _, gates_t = gate_net(gate_batch)
             batch = end - start
             teacher_gates[cursor : cursor + batch] = gates_t.detach().cpu().numpy().astype(np.float32)

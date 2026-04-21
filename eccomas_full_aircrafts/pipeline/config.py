@@ -39,7 +39,7 @@ class FullAircraftConfig:
     y_bins: int = 540
     reduced_surface: str = "upper"
 
-    expert_batch_size: int = 16_384
+    expert_batch_size: int = 32_768
     latent_batch_size: int = 32_768
     num_workers: int = 0
 

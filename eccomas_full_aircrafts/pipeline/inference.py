@@ -16,6 +16,15 @@ from .sensor_distillation import apply_hybrid_symbolic_sensor
 REGIME_NAMES = ["subsonic", "transonic", "supersonic"]
 
 
+def _load_latent_gate_indices(cfg: FullAircraftConfig) -> list[int]:
+    gate_config_path = cfg.models_dir / "latent_gate_config.json"
+    if not gate_config_path.exists():
+        return []
+    with gate_config_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    return [int(idx) for idx in payload.get("gate_feature_indices", [])]
+
+
 def _load_scaler(path: Path) -> tuple[np.ndarray, np.ndarray]:
     payload = np.load(path)
     return payload["mean"].astype(np.float32), payload["scale"].astype(np.float32)
@@ -62,7 +71,9 @@ def _expert_model_paths(cfg: FullAircraftConfig) -> list[Path]:
 
 def _load_neural_model(cfg: FullAircraftConfig) -> LatentSensorMoE:
     expert_input_dim = np.load(cfg.features_dir / "expert_features_train.npy", mmap_mode="r").shape[1]
-    gate_input_dim = np.load(cfg.features_dir / "gate_features_train.npy", mmap_mode="r").shape[1]
+    gate_feature_indices = _load_latent_gate_indices(cfg)
+    full_gate_dim = np.load(cfg.features_dir / "gate_features_train.npy", mmap_mode="r").shape[1]
+    gate_input_dim = len(gate_feature_indices) if gate_feature_indices else full_gate_dim
     model = LatentSensorMoE(
         gate_input_dim=gate_input_dim,
         expert_input_dim=expert_input_dim,
@@ -121,6 +132,7 @@ def predict_array(
     expert_mean, expert_scale = _load_scaler(cfg.scalers_dir / "expert_scaler.npz")
     gate_mean, gate_scale = _load_scaler(cfg.scalers_dir / "gate_scaler.npz")
     cp_mean, cp_scale = _load_scaler(cfg.scalers_dir / "cp_scaler.npz")
+    gate_feature_indices = _load_latent_gate_indices(cfg)
 
     cp_pred = np.zeros((n_rows, 1), dtype=np.float32)
     gates = np.zeros((n_rows, cfg.n_experts), dtype=np.float32)
@@ -150,6 +162,8 @@ def predict_array(
             if mode == "neural":
                 gate_chunk = build_encoder_features(x_chunk)
                 gate_chunk = _standardize(gate_chunk, gate_mean, gate_scale)
+                if gate_feature_indices:
+                    gate_chunk = gate_chunk[:, gate_feature_indices]
                 gate_tensor = torch.from_numpy(gate_chunk).to(cfg.device, non_blocking=True)
                 cp_norm_t, z_t, logits_t, gates_t = model(expert_tensor, gate_tensor)
                 cp_pred[start:end] = _destandardize(cp_norm_t.detach().cpu().numpy(), cp_mean, cp_scale)

@@ -1,15 +1,23 @@
 {
   "cut_threshold_y": 12.0,
-  "keep_side": ">=",
   "idx_keep_size": 49863,
-  "train": {
-    "rows": 15557256,
-    "kept_per_condition": 49863,
-    "n_conditions": 312
-  },
+  "keep_side": ">=",
   "test": {
-    "rows": 7778628,
     "kept_per_condition": 49863,
-    "n_conditions": 156
+    "kept_rows": 7778628,
+    "n_conditions": 156,
+    "raw_rows": 40680744,
+    "split": "test",
+    "x_path": "/Users/martaarnabatmartin/Desktop/eccomas/data_cut_y12/X_cut_test.npy",
+    "y_path": "/Users/martaarnabatmartin/Desktop/eccomas/data_cut_y12/Y_cut_test.npy"
+  },
+  "train": {
+    "kept_per_condition": 49863,
+    "kept_rows": 15557256,
+    "n_conditions": 312,
+    "raw_rows": 81361488,
+    "split": "train",
+    "x_path": "/Users/martaarnabatmartin/Desktop/eccomas/data_cut_y12/X_cut_train.npy",
+    "y_path": "/Users/martaarnabatmartin/Desktop/eccomas/data_cut_y12/Y_cut_train.npy"
   }
 }

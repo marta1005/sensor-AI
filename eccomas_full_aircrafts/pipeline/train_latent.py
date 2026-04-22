@@ -14,7 +14,6 @@ from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
 from eccomas_sensor_pipeline.eccomas_sensor.latent_viz import plot_latent_summary
-from eccomas_sensor_pipeline.eccomas_sensor.models import LatentSensorMoE
 
 from .config import FullAircraftConfig
 from .features import SYMBOLIC_GATE_ENCODER_FEATURE_NAMES, SYMBOLIC_GATE_ENCODER_INDICES
@@ -28,13 +27,11 @@ os.environ.setdefault("XDG_CACHE_HOME", str(_PLOT_CACHE / "xdg"))
 
 import matplotlib.pyplot as plt
 
+from .models import FullAircraftLatentMixer
 
-def _expert_model_paths(cfg: FullAircraftConfig) -> list[Path]:
-    return [
-        cfg.models_dir / "expert_subsonic.pth",
-        cfg.models_dir / "expert_transonic.pth",
-        cfg.models_dir / "expert_supersonic.pth",
-    ]
+
+def _expert_prediction_path(cfg: FullAircraftConfig, split: str) -> Path:
+    return cfg.features_dir / f"expert_pred_{split}.npy"
 
 
 def _latent_gate_config_path(cfg: FullAircraftConfig) -> Path:
@@ -43,6 +40,8 @@ def _latent_gate_config_path(cfg: FullAircraftConfig) -> Path:
 
 def _save_latent_gate_config(cfg: FullAircraftConfig) -> None:
     payload = {
+        "gate_architecture": cfg.latent_gate_architecture,
+        "latent_dim": int(cfg.latent_dim),
         "gate_feature_mode": "symbolic_subset",
         "gate_feature_indices": [int(idx) for idx in SYMBOLIC_GATE_ENCODER_INDICES],
         "gate_feature_names": list(SYMBOLIC_GATE_ENCODER_FEATURE_NAMES),
@@ -144,14 +143,17 @@ def _load_sampled_tensors(
     split: str,
     indices: np.ndarray,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    expert = np.asarray(np.load(cfg.features_dir / f"expert_features_{split}.npy", mmap_mode="r")[indices], dtype=np.float32)
+    expert_pred_path = _expert_prediction_path(cfg, split)
+    if not expert_pred_path.exists():
+        raise FileNotFoundError(f"Expert predictions not found: {expert_pred_path}. Run 'train-experts' first.")
+    expert = np.asarray(np.load(expert_pred_path, mmap_mode="r")[indices], dtype=np.float32)
     gate = np.asarray(np.load(cfg.features_dir / f"gate_features_{split}.npy", mmap_mode="r")[indices], dtype=np.float32)
     cp = np.asarray(np.load(cfg.features_dir / f"cp_{split}.npy", mmap_mode="r")[indices], dtype=np.float32)
     expert_id = np.asarray(np.load(cfg.features_dir / f"expert_id_{split}.npy", mmap_mode="r")[indices], dtype=np.int64)
 
     gate = gate[:, SYMBOLIC_GATE_ENCODER_INDICES]
     return (
-        torch.from_numpy(expert),
+        torch.from_numpy(expert[:, None, :]),
         torch.from_numpy(gate),
         torch.from_numpy(cp),
         torch.from_numpy(expert_id),
@@ -181,12 +183,17 @@ def _masked_hard_gate_loss(logits: torch.Tensor, targets: torch.Tensor, mask: to
     return F.cross_entropy(logits[mask], targets[mask])
 
 
+def _gate_entropy(gates: torch.Tensor) -> torch.Tensor:
+    return -(gates * torch.log(gates.clamp_min(1e-8))).sum(dim=1).mean()
+
+
 def _evaluate(
-    model: LatentSensorMoE,
+    model: FullAircraftLatentMixer,
     loader: DataLoader,
     device: torch.device,
     soft_gate_weight: float,
     hard_gate_weight: float,
+    entropy_weight: float,
     routing_temperature: float,
     oracle_margin_threshold: float,
 ) -> dict[str, float]:
@@ -198,33 +205,37 @@ def _evaluate(
     total_hard_gate = 0.0
     total_hard_acc = 0.0
     total_soft_agreement = 0.0
+    total_entropy = 0.0
     n = 0
     with torch.no_grad():
-        for expert_feat, gate_feat, cp, expert_id in loader:
-            expert_feat = expert_feat.to(device, non_blocking=True)
+        for expert_stack, gate_feat, cp, expert_id in loader:
+            expert_stack = expert_stack.to(device, non_blocking=True)
             gate_feat = gate_feat.to(device, non_blocking=True)
             cp = cp.to(device, non_blocking=True)
             expert_id = expert_id.to(device, non_blocking=True)
-            pred, _, logits, gates, expert_stack = model(expert_feat, gate_feat, return_expert_stack=True)
+            pred, _, logits, gates, expert_stack = model(expert_stack, gate_feat, return_expert_stack=True)
             soft_targets = _soft_routing_targets(expert_stack, cp, routing_temperature)
             reg_loss = reg_criterion(pred, cp)
             soft_gate_loss = _soft_gate_loss(logits, soft_targets)
             oracle_expert_id, oracle_margin = _oracle_expert_targets(expert_stack, cp)
-            ambiguous_mask = oracle_margin <= oracle_margin_threshold
-            hard_gate_loss = _masked_hard_gate_loss(logits, oracle_expert_id, ambiguous_mask)
-            loss = reg_loss + soft_gate_weight * soft_gate_loss + hard_gate_weight * hard_gate_loss
-            total += loss.item() * expert_feat.shape[0]
-            total_reg += reg_loss.item() * expert_feat.shape[0]
-            total_soft_gate += soft_gate_loss.item() * expert_feat.shape[0]
-            total_hard_gate += hard_gate_loss.item() * expert_feat.shape[0]
+            confident_mask = oracle_margin >= oracle_margin_threshold
+            hard_gate_loss = _masked_hard_gate_loss(logits, oracle_expert_id, confident_mask)
+            entropy = _gate_entropy(gates)
+            loss = reg_loss + soft_gate_weight * soft_gate_loss + hard_gate_weight * hard_gate_loss - entropy_weight * entropy
+            total += loss.item() * expert_stack.shape[0]
+            total_reg += reg_loss.item() * expert_stack.shape[0]
+            total_soft_gate += soft_gate_loss.item() * expert_stack.shape[0]
+            total_hard_gate += hard_gate_loss.item() * expert_stack.shape[0]
+            total_entropy += entropy.item() * expert_stack.shape[0]
             total_hard_acc += (torch.argmax(gates, dim=1) == oracle_expert_id).float().sum().item()
             total_soft_agreement += (torch.argmax(gates, dim=1) == torch.argmax(soft_targets, dim=1)).float().sum().item()
-            n += expert_feat.shape[0]
+            n += expert_stack.shape[0]
     return {
         "loss": total / max(1, n),
         "reg": total_reg / max(1, n),
         "soft_gate": total_soft_gate / max(1, n),
         "hard_gate": total_hard_gate / max(1, n),
+        "entropy": total_entropy / max(1, n),
         "hard_acc": total_hard_acc / max(1, n),
         "soft_agreement": total_soft_agreement / max(1, n),
     }
@@ -232,25 +243,25 @@ def _evaluate(
 
 def _export_latent_artifacts(
     cfg: FullAircraftConfig,
-    model: LatentSensorMoE,
+    model: FullAircraftLatentMixer,
     split: str,
     gate_feature_indices: list[int],
 ) -> None:
-    expert_features = np.load(cfg.features_dir / f"expert_features_{split}.npy", mmap_mode="r")
+    expert_stack = np.load(_expert_prediction_path(cfg, split), mmap_mode="r")
     gate_features = np.load(cfg.features_dir / f"gate_features_{split}.npy", mmap_mode="r")
     cut_x = np.load(cfg.cut_data_dir / f"X_cut_{split}.npy", mmap_mode="r")
     expert_id_all = np.load(cfg.features_dir / f"expert_id_{split}.npy", mmap_mode="r")
 
-    z_all = np.zeros((expert_features.shape[0], cfg.latent_dim), dtype=np.float32)
-    gates_all = np.zeros((expert_features.shape[0], cfg.n_experts), dtype=np.float32)
-    cp_pred_all = np.zeros((expert_features.shape[0], 1), dtype=np.float32)
+    z_all = np.zeros((expert_stack.shape[0], cfg.latent_dim), dtype=np.float32)
+    gates_all = np.zeros((expert_stack.shape[0], cfg.n_experts), dtype=np.float32)
+    cp_pred_all = np.zeros((expert_stack.shape[0], 1), dtype=np.float32)
 
     cursor = 0
     model.eval()
     with torch.no_grad():
-        for start in range(0, expert_features.shape[0], cfg.latent_batch_size):
-            end = min(expert_features.shape[0], start + cfg.latent_batch_size)
-            expert_batch = torch.from_numpy(np.asarray(expert_features[start:end], dtype=np.float32)).to(cfg.device, non_blocking=True)
+        for start in range(0, expert_stack.shape[0], cfg.latent_batch_size):
+            end = min(expert_stack.shape[0], start + cfg.latent_batch_size)
+            expert_batch = torch.from_numpy(np.asarray(expert_stack[start:end], dtype=np.float32)[:, None, :]).to(cfg.device, non_blocking=True)
             gate_batch = np.asarray(gate_features[start:end], dtype=np.float32)[:, gate_feature_indices]
             gate_batch = torch.from_numpy(gate_batch).to(cfg.device, non_blocking=True)
             cp_pred, z, _, gates = model(expert_batch, gate_batch)
@@ -274,10 +285,10 @@ def _export_latent_artifacts(
 
 def train_latent_pipeline(cfg: FullAircraftConfig) -> None:
     cfg.ensure_dirs()
-    expert_paths = _expert_model_paths(cfg)
-    for path in expert_paths:
-        if not path.exists():
-            raise FileNotFoundError(f"Expert model not found: {path}. Run 'train-experts' first.")
+    for split in ("train", "test"):
+        pred_path = _expert_prediction_path(cfg, split)
+        if not pred_path.exists():
+            raise FileNotFoundError(f"Expert predictions not found: {pred_path}. Run 'train-experts' first.")
 
     train_indices = _latent_sample_indices(cfg, "train", cfg.latent_train_max_samples, seed=31)
     test_indices = _latent_sample_indices(cfg, "test", cfg.latent_test_max_samples, seed=32)
@@ -304,14 +315,12 @@ def train_latent_pipeline(cfg: FullAircraftConfig) -> None:
         pin_memory=torch.cuda.is_available(),
     )
 
-    expert_input_dim = int(train_tensors[0].shape[1])
     gate_input_dim = int(train_tensors[1].shape[1])
 
-    model = LatentSensorMoE(
+    model = FullAircraftLatentMixer(
         gate_input_dim=gate_input_dim,
-        expert_input_dim=expert_input_dim,
         latent_dim=cfg.latent_dim,
-        expert_paths=expert_paths,
+        n_experts=cfg.n_experts,
     ).to(cfg.device)
 
     optimizer = optim.AdamW(model.gate_net.parameters(), lr=cfg.latent_lr, weight_decay=cfg.weight_decay)
@@ -330,31 +339,41 @@ def train_latent_pipeline(cfg: FullAircraftConfig) -> None:
         epoch_loss = 0.0
         n_rows = 0
         pbar = tqdm(train_loader, desc=f"[latent-full] epoch {epoch}/{cfg.latent_epochs}")
-        for expert_feat, gate_feat, cp, expert_id in pbar:
-            expert_feat = expert_feat.to(cfg.device, non_blocking=True)
+        for expert_stack, gate_feat, cp, expert_id in pbar:
+            expert_stack = expert_stack.to(cfg.device, non_blocking=True)
             gate_feat = gate_feat.to(cfg.device, non_blocking=True)
             cp = cp.to(cfg.device, non_blocking=True)
             expert_id = expert_id.to(cfg.device, non_blocking=True)
 
+            if cfg.latent_gate_noise_std > 0.0:
+                gate_feat = gate_feat + cfg.latent_gate_noise_std * torch.randn_like(gate_feat)
+
             optimizer.zero_grad(set_to_none=True)
-            pred, _, logits, gates, expert_stack = model(expert_feat, gate_feat, return_expert_stack=True)
+            pred, _, logits, gates, expert_stack = model(expert_stack, gate_feat, return_expert_stack=True)
             soft_targets = _soft_routing_targets(expert_stack, cp, cfg.routing_soft_temperature)
             reg_loss = reg_criterion(pred, cp)
             soft_gate_loss = _soft_gate_loss(logits, soft_targets)
             oracle_expert_id, oracle_margin = _oracle_expert_targets(expert_stack, cp)
-            ambiguous_mask = oracle_margin <= cfg.routing_oracle_margin
-            hard_gate_loss = _masked_hard_gate_loss(logits, oracle_expert_id, ambiguous_mask)
-            loss = reg_loss + cfg.latent_gate_weight * soft_gate_loss + cfg.latent_hard_gate_weight * hard_gate_loss
+            confident_mask = oracle_margin >= cfg.routing_oracle_margin
+            hard_gate_loss = _masked_hard_gate_loss(logits, oracle_expert_id, confident_mask)
+            entropy = _gate_entropy(gates)
+            loss = (
+                reg_loss
+                + cfg.latent_gate_weight * soft_gate_loss
+                + cfg.latent_hard_gate_weight * hard_gate_loss
+                - cfg.latent_entropy_weight * entropy
+            )
             loss.backward()
             optimizer.step()
 
-            epoch_loss += loss.item() * expert_feat.shape[0]
-            n_rows += expert_feat.shape[0]
+            epoch_loss += loss.item() * expert_stack.shape[0]
+            n_rows += expert_stack.shape[0]
             pbar.set_postfix(
                 loss=f"{loss.item():.5f}",
                 reg=f"{reg_loss.item():.5f}",
                 soft=f"{soft_gate_loss.item():.5f}",
                 hard=f"{hard_gate_loss.item():.5f}",
+                ent=f"{entropy.item():.5f}",
                 acc=f"{(torch.argmax(gates, dim=1) == oracle_expert_id).float().mean().item():.3f}",
             )
 
@@ -366,6 +385,7 @@ def train_latent_pipeline(cfg: FullAircraftConfig) -> None:
             cfg.device,
             cfg.latent_gate_weight,
             cfg.latent_hard_gate_weight,
+            cfg.latent_entropy_weight,
             cfg.routing_soft_temperature,
             cfg.routing_oracle_margin,
         )
@@ -375,6 +395,7 @@ def train_latent_pipeline(cfg: FullAircraftConfig) -> None:
             f"[latent-full] epoch {epoch:03d} | train={train_loss:.6f} | "
             f"test={test_metrics['loss']:.6f} | reg={test_metrics['reg']:.6f} | "
             f"soft_gate={test_metrics['soft_gate']:.6f} | hard_gate={test_metrics['hard_gate']:.6f} | "
+            f"entropy={test_metrics['entropy']:.6f} | "
             f"hard_acc={test_metrics['hard_acc']:.4f} | soft_agree={test_metrics['soft_agreement']:.4f}"
         )
 
@@ -387,8 +408,11 @@ def train_latent_pipeline(cfg: FullAircraftConfig) -> None:
                 "final_train_loss": float(history_train[-1]),
                 "final_test_loss": float(history_test[-1]),
                 "latent_dim": cfg.latent_dim,
+                "gate_architecture": cfg.latent_gate_architecture,
                 "soft_gate_weight": float(cfg.latent_gate_weight),
                 "hard_gate_weight": float(cfg.latent_hard_gate_weight),
+                "entropy_weight": float(cfg.latent_entropy_weight),
+                "gate_noise_std": float(cfg.latent_gate_noise_std),
                 "routing_soft_temperature": float(cfg.routing_soft_temperature),
                 "routing_oracle_margin": float(cfg.routing_oracle_margin),
                 "train_rows": int(len(train_dataset)),

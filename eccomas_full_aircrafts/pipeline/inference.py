@@ -10,10 +10,15 @@ from eccomas_sensor_pipeline.eccomas_sensor.models import CpExpertNet, LatentSen
 
 from .config import FullAircraftConfig
 from .features import build_encoder_features, build_expert_features
+from .models import FullAircraftLatentMixer, FullAircraftLatentSensorMoE
 from .sensor_distillation import apply_hybrid_symbolic_sensor
 
 
 REGIME_NAMES = ["subsonic", "transonic", "supersonic"]
+
+
+def _expert_prediction_path(cfg: FullAircraftConfig, split: str) -> Path:
+    return cfg.features_dir / f"expert_pred_{split}.npy"
 
 
 def _load_latent_gate_indices(cfg: FullAircraftConfig) -> list[int]:
@@ -23,6 +28,33 @@ def _load_latent_gate_indices(cfg: FullAircraftConfig) -> list[int]:
     with gate_config_path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
     return [int(idx) for idx in payload.get("gate_feature_indices", [])]
+
+
+def _load_latent_gate_architecture(cfg: FullAircraftConfig) -> str:
+    gate_config_path = cfg.models_dir / "latent_gate_config.json"
+    if not gate_config_path.exists():
+        return "legacy_hidden_plus_z"
+    with gate_config_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    return str(payload.get("gate_architecture", "legacy_hidden_plus_z"))
+
+
+def _load_expert_model_architecture(cfg: FullAircraftConfig) -> str:
+    config_path = cfg.models_dir / "expert_model_config.json"
+    if not config_path.exists():
+        return "legacy_mlp"
+    with config_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    return str(payload.get("expert_model_architecture", "legacy_mlp"))
+
+
+def _load_latent_dim(cfg: FullAircraftConfig) -> int:
+    gate_config_path = cfg.models_dir / "latent_gate_config.json"
+    if not gate_config_path.exists():
+        return int(cfg.latent_dim)
+    with gate_config_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    return int(payload.get("latent_dim", cfg.latent_dim))
 
 
 def _load_scaler(path: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -72,16 +104,45 @@ def _expert_model_paths(cfg: FullAircraftConfig) -> list[Path]:
 def _load_neural_model(cfg: FullAircraftConfig) -> LatentSensorMoE:
     expert_input_dim = np.load(cfg.features_dir / "expert_features_train.npy", mmap_mode="r").shape[1]
     gate_feature_indices = _load_latent_gate_indices(cfg)
+    gate_architecture = _load_latent_gate_architecture(cfg)
+    latent_dim = _load_latent_dim(cfg)
     full_gate_dim = np.load(cfg.features_dir / "gate_features_train.npy", mmap_mode="r").shape[1]
     gate_input_dim = len(gate_feature_indices) if gate_feature_indices else full_gate_dim
-    model = LatentSensorMoE(
-        gate_input_dim=gate_input_dim,
-        expert_input_dim=expert_input_dim,
-        latent_dim=cfg.latent_dim,
-        expert_paths=_expert_model_paths(cfg),
-    )
+    if gate_architecture == "latent_only_v1":
+        model = FullAircraftLatentSensorMoE(
+            gate_input_dim=gate_input_dim,
+            expert_input_dim=expert_input_dim,
+            latent_dim=latent_dim,
+            expert_paths=_expert_model_paths(cfg),
+        )
+    else:
+        model = LatentSensorMoE(
+            gate_input_dim=gate_input_dim,
+            expert_input_dim=expert_input_dim,
+            latent_dim=latent_dim,
+            expert_paths=_expert_model_paths(cfg),
+        )
     state = torch.load(cfg.models_dir / "latent_sensor_moe.pth", map_location="cpu")
     model.load_state_dict(state)
+    model.to(cfg.device)
+    model.eval()
+    return model
+
+
+def _load_neural_gate_mixer(cfg: FullAircraftConfig) -> FullAircraftLatentMixer:
+    gate_feature_indices = _load_latent_gate_indices(cfg)
+    latent_dim = _load_latent_dim(cfg)
+    gate_input_dim = len(gate_feature_indices) if gate_feature_indices else np.load(cfg.features_dir / "gate_features_train.npy", mmap_mode="r").shape[1]
+    model = FullAircraftLatentMixer(
+        gate_input_dim=gate_input_dim,
+        latent_dim=latent_dim,
+        n_experts=cfg.n_experts,
+    )
+    state = torch.load(cfg.models_dir / "latent_sensor_moe.pth", map_location="cpu")
+    gate_state = {k: v for k, v in state.items() if k.startswith("gate_net.")}
+    if not gate_state:
+        raise ValueError("Could not find gate_net weights inside latent_sensor_moe.pth")
+    model.load_state_dict(gate_state, strict=False)
     model.to(cfg.device)
     model.eval()
     return model
@@ -116,18 +177,29 @@ def _load_sensor_artifact(cfg: FullAircraftConfig):
     raise FileNotFoundError(f"Sensor artifact not found in {cfg.sensor_dir}. Run 'distill-sensor' first.")
 
 
+def _matching_reduced_split(cfg: FullAircraftConfig, input_path: Path) -> str | None:
+    resolved = input_path.expanduser().resolve()
+    for split in ("train", "test"):
+        candidate = (cfg.cut_data_dir / f"X_cut_{split}.npy").resolve()
+        if resolved == candidate:
+            return split
+    return None
+
+
 def predict_array(
     cfg: FullAircraftConfig,
     x_raw: np.ndarray,
     mode: str = "neural",
     batch_size: int | None = None,
     max_rows: int | None = None,
+    precomputed_expert_stack: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     if x_raw.ndim != 2 or x_raw.shape[1] < cfg.input_dim_raw:
         raise ValueError(f"Expected input shape [N, >= {cfg.input_dim_raw}], got {x_raw.shape}")
 
     n_rows = int(x_raw.shape[0] if max_rows is None else min(max_rows, int(x_raw.shape[0])))
     batch_size = int(batch_size or cfg.latent_batch_size)
+    expert_architecture = _load_expert_model_architecture(cfg)
 
     expert_mean, expert_scale = _load_scaler(cfg.scalers_dir / "expert_scaler.npz")
     gate_mean, gate_scale = _load_scaler(cfg.scalers_dir / "gate_scaler.npz")
@@ -141,11 +213,24 @@ def predict_array(
     if mode == "neural":
         z = np.zeros((n_rows, cfg.latent_dim), dtype=np.float32)
         sensor_scores = np.zeros((n_rows, cfg.n_experts), dtype=np.float32)
-        model = _load_neural_model(cfg)
+        if precomputed_expert_stack is not None:
+            model = _load_neural_gate_mixer(cfg)
+        else:
+            if expert_architecture != "legacy_mlp":
+                raise ValueError(
+                    "This inference path requires precomputed expert predictions for the U-Net experts. "
+                    "Run infer on X_cut_train.npy or X_cut_test.npy, or export matching expert predictions first."
+                )
+            model = _load_neural_model(cfg)
     elif mode == "symbolic":
         z = None
         sensor_scores = np.zeros((n_rows, cfg.n_experts), dtype=np.float32)
-        experts = _load_expert_models(cfg)
+        if precomputed_expert_stack is None and expert_architecture != "legacy_mlp":
+            raise ValueError(
+                "Symbolic inference with U-Net experts currently expects X_cut_train.npy or X_cut_test.npy "
+                "so it can reuse precomputed expert predictions."
+            )
+        experts = None if precomputed_expert_stack is not None else _load_expert_models(cfg)
         sensor_artifact = _load_sensor_artifact(cfg)
     else:
         raise ValueError(f"Unsupported inference mode: {mode}")
@@ -154,10 +239,13 @@ def predict_array(
         for start in range(0, n_rows, batch_size):
             end = min(n_rows, start + batch_size)
             x_chunk = np.asarray(x_raw[start:end, : cfg.input_dim_raw], dtype=np.float32)
-
-            expert_chunk = build_expert_features(x_chunk)
-            expert_chunk = _standardize(expert_chunk, expert_mean, expert_scale)
-            expert_tensor = torch.from_numpy(expert_chunk).to(cfg.device, non_blocking=True)
+            if precomputed_expert_stack is not None:
+                expert_stack_chunk = np.asarray(precomputed_expert_stack[start:end], dtype=np.float32)
+                expert_tensor = torch.from_numpy(expert_stack_chunk).to(cfg.device, non_blocking=True)
+            else:
+                expert_chunk = build_expert_features(x_chunk)
+                expert_chunk = _standardize(expert_chunk, expert_mean, expert_scale)
+                expert_tensor = torch.from_numpy(expert_chunk).to(cfg.device, non_blocking=True)
 
             if mode == "neural":
                 gate_chunk = build_encoder_features(x_chunk)
@@ -185,10 +273,13 @@ def predict_array(
                 else:
                     raise ValueError(f"Unsupported symbolic sensor artifact type: {sensor_artifact.get('type')}")
 
-                expert_outputs = []
-                for expert_model in experts:
-                    expert_outputs.append(expert_model(expert_tensor).detach().cpu().numpy().astype(np.float32))
-                expert_stack = np.stack(expert_outputs, axis=2)
+                if precomputed_expert_stack is not None:
+                    expert_stack = expert_stack_chunk[:, None, :] if expert_stack_chunk.ndim == 2 else expert_stack_chunk
+                else:
+                    expert_outputs = []
+                    for expert_model in experts or []:
+                        expert_outputs.append(expert_model(expert_tensor).detach().cpu().numpy().astype(np.float32))
+                    expert_stack = np.stack(expert_outputs, axis=2)
                 cp_norm = (expert_stack * gate_chunk[:, None, :]).sum(axis=2)
 
                 cp_pred[start:end] = _destandardize(cp_norm, cp_mean, cp_scale)
@@ -224,7 +315,23 @@ def run_inference(
         raise FileNotFoundError(f"Input array not found: {input_path}")
 
     x_raw = np.load(input_path, mmap_mode="r")
-    payload = predict_array(cfg, x_raw, mode=mode, batch_size=batch_size, max_rows=max_rows)
+    precomputed_expert_stack = None
+    split = _matching_reduced_split(cfg, input_path)
+    if split is not None:
+        expert_pred_path = _expert_prediction_path(cfg, split)
+        if expert_pred_path.exists():
+            pred = np.load(expert_pred_path, mmap_mode="r")
+            n_rows = int(pred.shape[0] if max_rows is None else min(max_rows, int(pred.shape[0])))
+            precomputed_expert_stack = np.asarray(pred[:n_rows], dtype=np.float32)
+
+    payload = predict_array(
+        cfg,
+        x_raw,
+        mode=mode,
+        batch_size=batch_size,
+        max_rows=max_rows,
+        precomputed_expert_stack=precomputed_expert_stack,
+    )
 
     if output_path is None:
         suffix = f"_{mode}.npz"

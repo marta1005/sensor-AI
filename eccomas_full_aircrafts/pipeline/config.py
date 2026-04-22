@@ -31,7 +31,7 @@ class FullAircraftConfig:
     raw_points_per_condition: int = 260_774
     input_dim_raw: int = 9
     output_dim_cp: int = 1
-    latent_dim: int = 3
+    latent_dim: int = 4
     n_experts: int = 3
     cp_column: int = 0
 
@@ -40,18 +40,24 @@ class FullAircraftConfig:
     reduced_surface: str = "upper"
 
     expert_batch_size: int = 32_768
+    expert_field_batch_size: int = 2
     latent_batch_size: int = 32_768
     num_workers: int = 0
 
     expert_epochs: int = 80
     latent_epochs: int = 24
 
+    expert_model_architecture: str = "unet2d_compact_v1"
+    expert_unet_base_channels: int = 16
     expert_lr: float = 1e-3
     latent_lr: float = 1e-3
     weight_decay: float = 1e-5
+    latent_gate_architecture: str = "latent_only_v1"
     latent_gate_weight: float = 0.55
-    latent_hard_gate_weight: float = 0.05
-    routing_soft_temperature: float = 0.08
+    latent_hard_gate_weight: float = 0.02
+    latent_entropy_weight: float = 0.01
+    latent_gate_noise_std: float = 0.01
+    routing_soft_temperature: float = 0.12
     routing_oracle_margin: float = 0.015
     latent_train_max_samples: int = 2_000_000
     latent_test_max_samples: int = 500_000

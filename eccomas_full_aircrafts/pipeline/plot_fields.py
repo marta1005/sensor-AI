@@ -250,7 +250,9 @@ def _eval_tb_inference_figure(
         ("Predicted $C_p$", cp_pred, "jet", cp_min, cp_max),
     ]
     if include_error:
-        fields.append(("Error", signed_err, "RdBu_r", -err_lim if err_lim > 0.0 else -1.0, err_lim if err_lim > 0.0 else 1.0))
+        err_vmin = -err_lim if err_lim > 0.0 else -1.0
+        err_vmax = err_lim if err_lim > 0.0 else 1.0
+        fields.append((f"Error [{err_vmin:.3f}, {err_vmax:.3f}]", signed_err, "RdBu_r", err_vmin, err_vmax))
 
     ncols = len(fields)
     use_tb = view == "tb"
@@ -480,15 +482,17 @@ def generate_inference_cp_grid_plot(
 
         _draw_pair(fig, outer[row, 0], xyz, cp_true_plot, "jet", cp_min, cp_max, "Truth $C_p$")
         _draw_pair(fig, outer[row, 1], xyz, cp_pred_plot, "jet", cp_min, cp_max, "Predicted $C_p$")
+        err_vmin = -err_lim if err_lim > 0.0 else -1.0
+        err_vmax = err_lim if err_lim > 0.0 else 1.0
         _draw_pair(
             fig,
             outer[row, 2],
             xyz,
             signed_err_plot,
             "RdBu_r",
-            -err_lim if err_lim > 0.0 else -1.0,
-            err_lim if err_lim > 0.0 else 1.0,
-            "Error",
+            err_vmin,
+            err_vmax,
+            f"Error [{err_vmin:.3f}, {err_vmax:.3f}]",
         )
 
         bbox_left = outer[row, 0].get_position(fig)

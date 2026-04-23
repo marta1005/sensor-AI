@@ -37,6 +37,10 @@ def _latent_gate_config_path(cfg: FullAircraftConfig) -> Path:
     return cfg.models_dir / "latent_gate_config.json"
 
 
+def _as_writable_array(values: np.ndarray, dtype: np.dtype | type[np.floating] = np.float32) -> np.ndarray:
+    return np.array(values, dtype=dtype, copy=True)
+
+
 def _save_latent_gate_config(cfg: FullAircraftConfig) -> None:
     payload = {
         "gate_architecture": cfg.latent_gate_architecture,
@@ -145,10 +149,10 @@ def _load_sampled_tensors(
     expert_pred_path = _expert_prediction_path(cfg, split)
     if not expert_pred_path.exists():
         raise FileNotFoundError(f"Expert predictions not found: {expert_pred_path}. Run 'train-experts' first.")
-    expert = np.asarray(np.load(expert_pred_path, mmap_mode="r")[indices], dtype=np.float32)
-    gate = np.asarray(np.load(cfg.features_dir / f"gate_features_{split}.npy", mmap_mode="r")[indices], dtype=np.float32)
-    cp = np.asarray(np.load(cfg.features_dir / f"cp_{split}.npy", mmap_mode="r")[indices], dtype=np.float32)
-    expert_id = np.asarray(np.load(cfg.features_dir / f"expert_id_{split}.npy", mmap_mode="r")[indices], dtype=np.int64)
+    expert = _as_writable_array(np.load(expert_pred_path, mmap_mode="r")[indices], dtype=np.float32)
+    gate = _as_writable_array(np.load(cfg.features_dir / f"gate_features_{split}.npy", mmap_mode="r")[indices], dtype=np.float32)
+    cp = _as_writable_array(np.load(cfg.features_dir / f"cp_{split}.npy", mmap_mode="r")[indices], dtype=np.float32)
+    expert_id = np.array(np.load(cfg.features_dir / f"expert_id_{split}.npy", mmap_mode="r")[indices], dtype=np.int64, copy=True)
 
     gate = gate[:, SYMBOLIC_GATE_ENCODER_INDICES]
     return (
@@ -260,8 +264,9 @@ def _export_latent_artifacts(
     with torch.no_grad():
         for start in range(0, expert_stack.shape[0], cfg.latent_batch_size):
             end = min(expert_stack.shape[0], start + cfg.latent_batch_size)
-            expert_batch = torch.from_numpy(np.asarray(expert_stack[start:end], dtype=np.float32)[:, None, :]).to(cfg.device, non_blocking=True)
-            gate_batch = np.asarray(gate_features[start:end], dtype=np.float32)[:, gate_feature_indices]
+            expert_chunk = _as_writable_array(expert_stack[start:end], dtype=np.float32)
+            expert_batch = torch.from_numpy(expert_chunk[:, None, :]).to(cfg.device, non_blocking=True)
+            gate_batch = _as_writable_array(gate_features[start:end], dtype=np.float32)[:, gate_feature_indices]
             gate_batch = torch.from_numpy(gate_batch).to(cfg.device, non_blocking=True)
             cp_pred, z, _, gates = model(expert_batch, gate_batch)
             batch = end - start

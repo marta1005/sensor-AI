@@ -6,11 +6,9 @@ import json
 import numpy as np
 import torch
 
-from eccomas_sensor_pipeline.eccomas_sensor.models import CpExpertNet, LatentSensorMoE
-
 from .config import FullAircraftConfig
 from .features import build_encoder_features, build_expert_features
-from .models import FullAircraftLatentMixer, FullAircraftLatentSensorMoE
+from .models import CpExpertNet, FullAircraftLatentMixer, FullAircraftLatentSensorMoE, LegacyLatentSensorMoE
 from .sensor_distillation import apply_hybrid_symbolic_sensor
 
 
@@ -101,7 +99,7 @@ def _expert_model_paths(cfg: FullAircraftConfig) -> list[Path]:
     return [cfg.models_dir / f"expert_{name}.pth" for name in REGIME_NAMES]
 
 
-def _load_neural_model(cfg: FullAircraftConfig) -> LatentSensorMoE:
+def _load_neural_model(cfg: FullAircraftConfig) -> LegacyLatentSensorMoE | FullAircraftLatentSensorMoE:
     expert_input_dim = np.load(cfg.features_dir / "expert_features_train.npy", mmap_mode="r").shape[1]
     gate_feature_indices = _load_latent_gate_indices(cfg)
     gate_architecture = _load_latent_gate_architecture(cfg)
@@ -116,7 +114,7 @@ def _load_neural_model(cfg: FullAircraftConfig) -> LatentSensorMoE:
             expert_paths=_expert_model_paths(cfg),
         )
     else:
-        model = LatentSensorMoE(
+        model = LegacyLatentSensorMoE(
             gate_input_dim=gate_input_dim,
             expert_input_dim=expert_input_dim,
             latent_dim=latent_dim,

@@ -13,10 +13,9 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
-from eccomas_sensor_pipeline.eccomas_sensor.latent_viz import plot_latent_summary
-
 from .config import FullAircraftConfig
 from .features import SYMBOLIC_GATE_ENCODER_FEATURE_NAMES, SYMBOLIC_GATE_ENCODER_INDICES
+from .latent_viz import plot_latent_summary
 from .utils import raw_paths
 
 _PLOT_CACHE = Path(__file__).resolve().parent / ".plot_cache"

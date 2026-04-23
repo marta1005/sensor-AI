@@ -14,11 +14,6 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from eccomas_sensor_pipeline.eccomas_sensor.train_experts import (
-    REGIME_NAMES,
-    _regime_sample_weights,
-)
-
 from .config import FullAircraftConfig
 from .models import FullAircraftExpertUNet
 from .surface_grid import CompactSurfaceGrid
@@ -31,6 +26,44 @@ os.environ.setdefault("MPLCONFIGDIR", str(_PLOT_CACHE / "mpl"))
 os.environ.setdefault("XDG_CACHE_HOME", str(_PLOT_CACHE / "xdg"))
 
 import matplotlib.pyplot as plt
+
+
+REGIME_NAMES = ["subsonic", "transonic", "supersonic"]
+
+
+def _regime_sample_weights(mach: np.ndarray, cfg: FullAircraftConfig, regime_id: int) -> np.ndarray:
+    mach = np.asarray(mach, dtype=np.float32)
+    weights = np.zeros_like(mach, dtype=np.float32)
+    margin = float(cfg.expert_overlap_margin)
+    floor = float(cfg.expert_overlap_min_weight)
+
+    if regime_id == 0:
+        core = mach <= cfg.mach_sub_max
+        weights[core] = 1.0
+        if margin > 0.0:
+            overlap = (mach > cfg.mach_sub_max) & (mach <= cfg.mach_sub_max + margin)
+            frac = (mach[overlap] - cfg.mach_sub_max) / margin
+            weights[overlap] = 1.0 - (1.0 - floor) * frac
+    elif regime_id == 1:
+        core = (mach >= cfg.mach_sub_max) & (mach <= cfg.mach_trans_max)
+        weights[core] = 1.0
+        if margin > 0.0:
+            lower = (mach >= cfg.mach_sub_max - margin) & (mach < cfg.mach_sub_max)
+            lower_frac = (mach[lower] - (cfg.mach_sub_max - margin)) / margin
+            weights[lower] = floor + (1.0 - floor) * lower_frac
+
+            upper = (mach > cfg.mach_trans_max) & (mach <= cfg.mach_trans_max + margin)
+            upper_frac = 1.0 - (mach[upper] - cfg.mach_trans_max) / margin
+            weights[upper] = floor + (1.0 - floor) * upper_frac
+    else:
+        core = mach >= cfg.mach_trans_max
+        weights[core] = 1.0
+        if margin > 0.0:
+            overlap = (mach >= cfg.mach_trans_max - margin) & (mach < cfg.mach_trans_max)
+            frac = (cfg.mach_trans_max - mach[overlap]) / margin
+            weights[overlap] = 1.0 - (1.0 - floor) * frac
+
+    return weights.astype(np.float32)
 
 
 def _feature_paths(cfg: FullAircraftConfig, split: str) -> tuple[Path, Path, Path]:

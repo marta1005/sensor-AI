@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 from __future__ import annotations
 
 import argparse
@@ -27,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("inspect-raw", parents=[common], help="Summarize full-aircraft raw arrays and condition ranges")
+    subparsers.add_parser("explore-dataset", parents=[common], help="Generate dataset characterization plots and summaries")
 
     surface_parser = subparsers.add_parser(
         "prepare-reference-surface",
@@ -164,6 +167,10 @@ def main() -> None:
         from eccomas_full_aircrafts.pipeline.prepare_surface import inspect_raw_dataset
 
         inspect_raw_dataset(cfg)
+    elif args.command == "explore-dataset":
+        from eccomas_full_aircrafts.pipeline.explore_dataset import characterize_dataset
+
+        characterize_dataset(cfg)
     elif args.command == "prepare-reference-surface":
         from eccomas_full_aircrafts.pipeline.prepare_surface import prepare_reference_surface
 

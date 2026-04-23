@@ -7,11 +7,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from eccomas_sensor_pipeline.eccomas_sensor.models import LatentGateNet
-
 from .config import FullAircraftConfig
 from .features import ENCODER_FEATURE_NAMES, SYMBOLIC_GATE_ENCODER_FEATURE_NAMES, SYMBOLIC_GATE_ENCODER_INDICES, build_encoder_features
-from .models import FullAircraftLatentGateNet
+from .models import FullAircraftLatentGateNet, LegacyLatentGateNet
 from .utils import sample_indices
 
 _PLOT_CACHE = Path(__file__).resolve().parent / ".plot_cache"
@@ -117,7 +115,7 @@ def _render_linear_equation(intercept: float, coefficients: np.ndarray, basis_na
     return "clip(" + "".join(parts) + ", 0, inf)"
 
 
-def _load_teacher_gate_net(cfg: FullAircraftConfig) -> LatentGateNet:
+def _load_teacher_gate_net(cfg: FullAircraftConfig) -> LegacyLatentGateNet | FullAircraftLatentGateNet:
     gate_config_path = cfg.models_dir / "latent_gate_config.json"
     gate_architecture = "legacy_hidden_plus_z"
     latent_dim = int(cfg.latent_dim)
@@ -131,7 +129,7 @@ def _load_teacher_gate_net(cfg: FullAircraftConfig) -> LatentGateNet:
     if gate_architecture == "latent_only_v1":
         gate_net = FullAircraftLatentGateNet(gate_input_dim=gate_input_dim, latent_dim=latent_dim, n_experts=cfg.n_experts)
     else:
-        gate_net = LatentGateNet(gate_input_dim=gate_input_dim, latent_dim=latent_dim, n_experts=cfg.n_experts)
+        gate_net = LegacyLatentGateNet(gate_input_dim=gate_input_dim, latent_dim=latent_dim, n_experts=cfg.n_experts)
 
     state = torch.load(cfg.models_dir / "latent_sensor_moe.pth", map_location="cpu")
     gate_state = {}
@@ -149,7 +147,7 @@ def _load_teacher_gate_net(cfg: FullAircraftConfig) -> LatentGateNet:
 
 def _teacher_outputs(
     cfg: FullAircraftConfig,
-    gate_net: LatentGateNet,
+    gate_net: LegacyLatentGateNet | FullAircraftLatentGateNet,
     split: str,
     max_samples: int,
     seed: int,

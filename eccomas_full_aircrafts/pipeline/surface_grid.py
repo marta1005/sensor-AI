@@ -53,12 +53,19 @@ class CompactSurfaceGrid:
 
     def gather_numpy(self, grid_values: np.ndarray) -> np.ndarray:
         if grid_values.ndim == 3:
-            return grid_values[:, self.row_idx, self.col_idx].T.astype(np.float32)
+            gathered = np.asarray(grid_values[:, self.row_idx, self.col_idx], dtype=np.float32)
+            if gathered.shape[0] == grid_values.shape[0]:
+                return gathered.T.astype(np.float32)
+            return gathered.astype(np.float32)
         if grid_values.ndim == 4:
             batch = grid_values.shape[0]
             gathered = np.zeros((batch, self.n_points, grid_values.shape[1]), dtype=np.float32)
             for idx in range(batch):
-                gathered[idx] = grid_values[idx, :, self.row_idx, self.col_idx].T.astype(np.float32)
+                gathered_single = np.asarray(grid_values[idx, :, self.row_idx, self.col_idx], dtype=np.float32)
+                if gathered_single.shape[0] == grid_values.shape[1]:
+                    gathered[idx] = gathered_single.T.astype(np.float32)
+                else:
+                    gathered[idx] = gathered_single.astype(np.float32)
             return gathered
         raise ValueError(f"Expected [C,H,W] or [B,C,H,W], got {grid_values.shape}")
 

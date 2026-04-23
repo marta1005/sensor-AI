@@ -1,6 +1,6 @@
 # Eccomas Full Aircraft
 
-Línea nueva para trabajar con el dataset ONERA completo usando una representación reducida de superficie, sin tocar el pipeline actual de `eccomas_sensor_pipeline`.
+Pipeline activa para trabajar con el dataset ONERA completo usando una representación reducida de superficie.
 
 ## Objetivo
 
@@ -32,6 +32,8 @@ python eccomas_full_aircrafts/main.py prepare-reduced-data \
 
 python eccomas_full_aircrafts/main.py prepare-features
 
+python eccomas_full_aircrafts/main.py explore-dataset
+
 python eccomas_full_aircrafts/main.py train-experts
 
 python eccomas_full_aircrafts/main.py train-latent
@@ -58,9 +60,10 @@ python eccomas_full_aircrafts/main.py infer \
   Predicciones `neural` o `symbolic`
 - `results/`
   Figuras de referencia y `Cp fields` raw
+- `exploration_data/`
+  Caracterización del dataset, diseño experimental y rangos de `Cp`
 
 ## Notas
 
 - La ruta de entrenamiento actual está pensada para una sola cara de referencia cada vez. El default es `upper`.
 - `plot-raw-fields` ya soporta `points` y `surface`, pero la visualización principal recomendada sigue siendo `points`.
-- `mach_experts` sigue sin estar conectado a esta línea.

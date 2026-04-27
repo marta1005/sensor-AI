@@ -299,3 +299,86 @@ class FullAircraftLatentSensorMoE(nn.Module):
         if return_expert_stack:
             return mixed, z, logits, gates, stacked
         return mixed, z, logits, gates
+
+
+class DiffusionTimeEmbedding(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+        self.proj = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.SiLU(),
+            nn.Linear(dim * 2, dim),
+        )
+
+    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
+        device = timesteps.device
+        half_dim = self.dim // 2
+        freq = torch.exp(
+            -math.log(10_000.0) * torch.arange(half_dim, device=device, dtype=torch.float32) / max(half_dim - 1, 1)
+        )
+        args = timesteps.float().unsqueeze(1) * freq.unsqueeze(0)
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=1)
+        if emb.shape[1] < self.dim:
+            emb = F.pad(emb, (0, self.dim - emb.shape[1]))
+        return self.proj(emb)
+
+
+class _TimeResBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, time_dim: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.norm1 = nn.GroupNorm(_group_count(out_channels), out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.norm2 = nn.GroupNorm(_group_count(out_channels), out_channels)
+        self.time_proj = nn.Linear(time_dim, out_channels)
+        self.skip = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
+
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        h = self.conv1(x)
+        h = self.norm1(h)
+        h = h + self.time_proj(t_emb).unsqueeze(-1).unsqueeze(-1)
+        h = F.silu(h)
+        h = self.conv2(h)
+        h = self.norm2(h)
+        h = F.silu(h)
+        return h + self.skip(x)
+
+
+class ResidualDiffusionUNet(nn.Module):
+    def __init__(self, cond_channels: int, base_channels: int = 32, time_dim: int = 128):
+        super().__init__()
+        self.time_embed = DiffusionTimeEmbedding(time_dim)
+        in_channels = cond_channels + 1  # noisy residual is concatenated with the pre-packed conditioning tensor
+
+        c1 = base_channels
+        c2 = c1 * 2
+        c3 = c2 * 2
+
+        self.in_block = _TimeResBlock(in_channels, c1, time_dim)
+        self.down1 = _TimeResBlock(c1, c2, time_dim)
+        self.down2 = _TimeResBlock(c2, c3, time_dim)
+        self.mid = _TimeResBlock(c3, c3, time_dim)
+        self.up2 = _TimeResBlock(c3 + c2, c2, time_dim)
+        self.up1 = _TimeResBlock(c2 + c1, c1, time_dim)
+        self.head = nn.Sequential(
+            nn.Conv2d(c1, c1, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(c1, 1, kernel_size=1),
+        )
+        self.pool = nn.AvgPool2d(kernel_size=2, stride=2)
+
+    def forward(self, noisy_residual: torch.Tensor, cond: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+        t_emb = self.time_embed(timesteps)
+        x = torch.cat([noisy_residual, cond], dim=1)
+
+        s1 = self.in_block(x, t_emb)
+        d1 = self.down1(self.pool(s1), t_emb)
+        d2 = self.down2(self.pool(d1), t_emb)
+        mid = self.mid(d2, t_emb)
+
+        up2 = F.interpolate(mid, size=d1.shape[-2:], mode="bilinear", align_corners=False)
+        up2 = self.up2(torch.cat([up2, d1], dim=1), t_emb)
+        up1 = F.interpolate(up2, size=s1.shape[-2:], mode="bilinear", align_corners=False)
+        up1 = self.up1(torch.cat([up1, s1], dim=1), t_emb)
+        return self.head(up1)

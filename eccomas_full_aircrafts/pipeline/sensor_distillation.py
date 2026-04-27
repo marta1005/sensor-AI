@@ -20,8 +20,8 @@ os.environ.setdefault("XDG_CACHE_HOME", str(_PLOT_CACHE / "xdg"))
 
 import matplotlib.pyplot as plt
 
+from .cluster_partition import expert_names
 
-REGIME_NAMES = ["subsonic", "transonic", "supersonic"]
 HYBRID_FEATURE_INDICES = SYMBOLIC_GATE_ENCODER_INDICES
 HYBRID_FEATURE_NAMES = SYMBOLIC_GATE_ENCODER_FEATURE_NAMES
 BAND_EXTRA_FEATURE_NAMES = [
@@ -59,6 +59,47 @@ def _normalize_positive_scores(scores: np.ndarray, eps: float = 1e-8) -> np.ndar
 
 def _band_limits(cfg: FullAircraftConfig) -> tuple[float, float]:
     return float(cfg.mach_sub_max - cfg.expert_overlap_margin), float(cfg.mach_trans_max + cfg.expert_overlap_margin)
+
+
+def _solve_linear_symbolic_scores(
+    basis_train: np.ndarray,
+    teacher_gates_train: np.ndarray,
+    cfg: FullAircraftConfig,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[float], list[str]]:
+    mean = basis_train.mean(axis=0)
+    scale = basis_train.std(axis=0) + 1e-6
+    standardized = np.clip((basis_train - mean) / scale, -cfg.sensor_feature_clip, cfg.sensor_feature_clip)
+    design = np.concatenate([np.ones((standardized.shape[0], 1), dtype=np.float64), standardized], axis=1)
+    gram = design.T @ design
+    ridge = np.eye(gram.shape[0], dtype=np.float64)
+    ridge[0, 0] = 0.0
+    system = gram + float(cfg.sensor_ridge_alpha) * ridge
+
+    coefficients_std: list[np.ndarray] = []
+    coefficients_raw: list[np.ndarray] = []
+    intercepts_raw: list[float] = []
+    equations: list[str] = []
+
+    for dim in range(cfg.n_experts):
+        target = teacher_gates_train[:, dim].astype(np.float64)
+        rhs = design.T @ target
+        coef_std = np.linalg.solve(system, rhs)
+        coef_raw = coef_std[1:] / scale
+        intercept_raw = float(coef_std[0] - np.sum(coef_std[1:] * mean / scale))
+
+        coefficients_std.append(coef_std.astype(np.float64))
+        coefficients_raw.append(coef_raw.astype(np.float64))
+        intercepts_raw.append(intercept_raw)
+        equations.append(_render_linear_equation(intercept_raw, coef_raw, SYMBOLIC_BASIS_NAMES))
+
+    return (
+        mean.astype(np.float64),
+        scale.astype(np.float64),
+        np.stack(coefficients_std, axis=1).astype(np.float64),
+        np.stack(coefficients_raw, axis=1).astype(np.float64),
+        intercepts_raw,
+        equations,
+    )
 
 
 def _build_symbolic_basis(x_raw: np.ndarray, cfg: FullAircraftConfig) -> np.ndarray:
@@ -189,8 +230,6 @@ def _fit_hybrid_symbolic_sensor(
     cfg: FullAircraftConfig,
 ) -> dict[str, object]:
     basis_train = _build_symbolic_basis(x_train, cfg)
-    mean = basis_train.mean(axis=0)
-    scale = basis_train.std(axis=0) + 1e-6
 
     band_lower, band_upper = _band_limits(cfg)
     mach_train = x_train[:, 6]
@@ -198,29 +237,11 @@ def _fit_hybrid_symbolic_sensor(
     if not np.any(in_band):
         raise ValueError("Hybrid sensor fit produced an empty transonic band.")
 
-    standardized = np.clip((basis_train[in_band] - mean) / scale, -cfg.sensor_feature_clip, cfg.sensor_feature_clip)
-    design = np.concatenate([np.ones((standardized.shape[0], 1), dtype=np.float64), standardized], axis=1)
-    gram = design.T @ design
-    ridge = np.eye(gram.shape[0], dtype=np.float64)
-    ridge[0, 0] = 0.0
-    system = gram + float(cfg.sensor_ridge_alpha) * ridge
-
-    coefficients_std: list[np.ndarray] = []
-    coefficients_raw: list[np.ndarray] = []
-    intercepts_raw: list[float] = []
-    equations: list[str] = []
-
-    for dim in range(cfg.n_experts):
-        target = teacher_gates_train[in_band, dim].astype(np.float64)
-        rhs = design.T @ target
-        coef_std = np.linalg.solve(system, rhs)
-        coef_raw = coef_std[1:] / scale
-        intercept_raw = float(coef_std[0] - np.sum(coef_std[1:] * mean / scale))
-
-        coefficients_std.append(coef_std.astype(np.float64))
-        coefficients_raw.append(coef_raw.astype(np.float64))
-        intercepts_raw.append(intercept_raw)
-        equations.append(_render_linear_equation(intercept_raw, coef_raw, SYMBOLIC_BASIS_NAMES))
+    mean, scale, coefficients_std, coefficients_raw, intercepts_raw, equations = _solve_linear_symbolic_scores(
+        basis_train[in_band],
+        teacher_gates_train[in_band],
+        cfg,
+    )
 
     return {
         "type": "hybrid_linear_band",
@@ -229,12 +250,39 @@ def _fit_hybrid_symbolic_sensor(
         "band_upper": band_upper,
         "feature_indices": HYBRID_FEATURE_INDICES,
         "feature_names": SYMBOLIC_BASIS_NAMES,
-        "feature_mean": mean.astype(np.float64).tolist(),
-        "feature_scale": scale.astype(np.float64).tolist(),
+        "feature_mean": mean.tolist(),
+        "feature_scale": scale.tolist(),
         "ridge_alpha": float(cfg.sensor_ridge_alpha),
         "feature_clip": float(cfg.sensor_feature_clip),
-        "coefficients_std": np.stack(coefficients_std, axis=1).astype(np.float64).tolist(),
-        "coefficients_raw": np.stack(coefficients_raw, axis=1).astype(np.float64).tolist(),
+        "coefficients_std": coefficients_std.tolist(),
+        "coefficients_raw": coefficients_raw.tolist(),
+        "intercepts_raw": intercepts_raw,
+        "equations": equations,
+    }
+
+
+def _fit_global_symbolic_sensor(
+    x_train: np.ndarray,
+    teacher_gates_train: np.ndarray,
+    cfg: FullAircraftConfig,
+) -> dict[str, object]:
+    basis_train = _build_symbolic_basis(x_train, cfg)
+    mean, scale, coefficients_std, coefficients_raw, intercepts_raw, equations = _solve_linear_symbolic_scores(
+        basis_train,
+        teacher_gates_train,
+        cfg,
+    )
+    return {
+        "type": "global_linear_scores",
+        "description": "Global symbolic linear scores fitted over all rows for cluster-based routing.",
+        "feature_indices": HYBRID_FEATURE_INDICES,
+        "feature_names": SYMBOLIC_BASIS_NAMES,
+        "feature_mean": mean.tolist(),
+        "feature_scale": scale.tolist(),
+        "ridge_alpha": float(cfg.sensor_ridge_alpha),
+        "feature_clip": float(cfg.sensor_feature_clip),
+        "coefficients_std": coefficients_std.tolist(),
+        "coefficients_raw": coefficients_raw.tolist(),
         "intercepts_raw": intercepts_raw,
         "equations": equations,
     }
@@ -252,21 +300,26 @@ def apply_hybrid_symbolic_sensor(
     clip_value = float(artifact.get("feature_clip", cfg.sensor_feature_clip))
 
     standardized = np.clip((basis - mean) / scale, -clip_value, clip_value)
-    mach = np.asarray(x_raw[:, 6], dtype=np.float64)
-    band_lower = float(artifact["band_lower"])
-    band_upper = float(artifact["band_upper"])
+    design = np.concatenate([np.ones((standardized.shape[0], 1), dtype=np.float64), standardized], axis=1)
+    artifact_type = str(artifact.get("type", "hybrid_linear_band"))
 
-    scores = np.zeros((x_raw.shape[0], cfg.n_experts), dtype=np.float64)
-    lower_mask = mach < band_lower
-    upper_mask = mach > band_upper
-    band_mask = ~(lower_mask | upper_mask)
+    if artifact_type == "global_linear_scores":
+        scores = design @ coef_std
+    else:
+        mach = np.asarray(x_raw[:, 6], dtype=np.float64)
+        band_lower = float(artifact["band_lower"])
+        band_upper = float(artifact["band_upper"])
 
-    scores[lower_mask, 0] = 1.0
-    scores[upper_mask, 2] = 1.0
+        scores = np.zeros((x_raw.shape[0], cfg.n_experts), dtype=np.float64)
+        lower_mask = mach < band_lower
+        upper_mask = mach > band_upper
+        band_mask = ~(lower_mask | upper_mask)
 
-    if np.any(band_mask):
-        design = np.concatenate([np.ones((int(np.count_nonzero(band_mask)), 1), dtype=np.float64), standardized[band_mask]], axis=1)
-        scores[band_mask] = design @ coef_std
+        scores[lower_mask, 0] = 1.0
+        scores[upper_mask, min(2, cfg.n_experts - 1)] = 1.0
+
+        if np.any(band_mask):
+            scores[band_mask] = design[band_mask] @ coef_std
 
     scores = np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
     gates = _normalize_positive_scores(scores.astype(np.float32))
@@ -284,15 +337,20 @@ def distill_sensor(cfg: FullAircraftConfig) -> None:
     train_x, train_teacher_gates, _ = _teacher_outputs(cfg, gate_net, "train", cfg.sensor_max_samples, seed=21)
     test_x, test_teacher_gates, _ = _teacher_outputs(cfg, gate_net, "test", cfg.sensor_max_samples, seed=22)
 
-    artifact = _fit_hybrid_symbolic_sensor(train_x, train_teacher_gates, cfg)
+    artifact = (
+        _fit_hybrid_symbolic_sensor(train_x, train_teacher_gates, cfg)
+        if cfg.expert_partition_mode == "mach"
+        else _fit_global_symbolic_sensor(train_x, train_teacher_gates, cfg)
+    )
     test_scores, test_symbolic_gates = apply_hybrid_symbolic_sensor(test_x, artifact, cfg)
 
     teacher_argmax_test = np.argmax(test_teacher_gates, axis=1)
     symbolic_argmax_test = np.argmax(test_symbolic_gates, axis=1)
 
+    regime_names = expert_names(cfg)
     summary: dict[str, dict[str, float | str]] = {}
     equations = artifact["equations"]
-    for dim, regime_name in enumerate(REGIME_NAMES):
+    for dim, regime_name in enumerate(regime_names):
         gate_mae = float(np.mean(np.abs(test_symbolic_gates[:, dim] - test_teacher_gates[:, dim])))
         gate_rmse = float(np.sqrt(np.mean((test_symbolic_gates[:, dim] - test_teacher_gates[:, dim]) ** 2)))
         argmax_recall = float(np.mean(symbolic_argmax_test[teacher_argmax_test == dim] == dim)) if np.any(teacher_argmax_test == dim) else 0.0
@@ -323,10 +381,9 @@ def distill_sensor(cfg: FullAircraftConfig) -> None:
 
     overall = {
         "type": str(artifact["type"]),
+        "partition_mode": cfg.expert_partition_mode,
         "train_rows": int(train_x.shape[0]),
         "test_rows": int(test_x.shape[0]),
-        "band_lower": float(artifact["band_lower"]),
-        "band_upper": float(artifact["band_upper"]),
         "ridge_alpha": float(artifact["ridge_alpha"]),
         "argmax_agreement_test": float(np.mean(symbolic_argmax_test == teacher_argmax_test)),
         "gate_mae_test": float(np.mean(np.abs(test_symbolic_gates - test_teacher_gates))),
@@ -334,18 +391,22 @@ def distill_sensor(cfg: FullAircraftConfig) -> None:
         "teacher_argmax_counts_test": np.bincount(teacher_argmax_test, minlength=cfg.n_experts).astype(int).tolist(),
         "symbolic_argmax_counts_test": np.bincount(symbolic_argmax_test, minlength=cfg.n_experts).astype(int).tolist(),
     }
+    if "band_lower" in artifact and "band_upper" in artifact:
+        overall["band_lower"] = float(artifact["band_lower"])
+        overall["band_upper"] = float(artifact["band_upper"])
 
     with (cfg.sensor_dir / "sensor_hybrid.json").open("w", encoding="utf-8") as handle:
         json.dump(artifact, handle, indent=2)
     with (cfg.sensor_dir / "sensor_hybrid.txt").open("w", encoding="utf-8") as handle:
+        handle.write(f"type={artifact['type']}\n")
+        if "band_lower" in artifact and "band_upper" in artifact:
+            handle.write(f"band_lower={artifact['band_lower']:.6f}\n")
+            handle.write(f"band_upper={artifact['band_upper']:.6f}\n")
         handle.write(
-            f"type={artifact['type']}\n"
-            f"band_lower={artifact['band_lower']:.6f}\n"
-            f"band_upper={artifact['band_upper']:.6f}\n"
             f"ridge_alpha={artifact['ridge_alpha']:.6f}\n"
             f"feature_clip={artifact['feature_clip']:.6f}\n\n"
         )
-        for regime_name, equation in zip(REGIME_NAMES, equations):
+        for regime_name, equation in zip(regime_names, equations):
             handle.write(f"{regime_name}: {equation}\n")
 
     with (cfg.sensor_dir / "summary.json").open("w", encoding="utf-8") as handle:

@@ -27,6 +27,7 @@ class FullAircraftConfig:
     inference_dir: Optional[Path] = None
     sensor_dir: Optional[Path] = None
     symbolic_dir: Optional[Path] = None
+    diffusion_dir: Optional[Path] = None
 
     raw_points_per_condition: int = 260_774
     input_dim_raw: int = 9
@@ -34,6 +35,10 @@ class FullAircraftConfig:
     latent_dim: int = 4
     n_experts: int = 3
     cp_column: int = 0
+    expert_partition_mode: str = "hybrid"
+    cluster_algorithm: str = "kmeans"
+    cluster_count: int = 3
+    hybrid_source_clusters: int = 5
 
     x_bins: int = 1080
     y_bins: int = 540
@@ -74,6 +79,17 @@ class FullAircraftConfig:
     sensor_ridge_alpha: float = 1e-2
     sensor_feature_clip: float = 8.0
 
+    diffusion_train_mode: str = "symbolic"
+    diffusion_batch_size: int = 2
+    diffusion_epochs: int = 60
+    diffusion_lr: float = 2e-4
+    diffusion_weight_decay: float = 1e-5
+    diffusion_timesteps: int = 200
+    diffusion_sample_steps: int = 50
+    diffusion_base_channels: int = 32
+    diffusion_cond_feature_dim: int = 15
+    diffusion_shock_weight: float = 2.0
+
     def __post_init__(self) -> None:
         default_project_root = Path(__file__).resolve().parents[2]
         project_root = self._normalize_path(self.project_root or default_project_root)
@@ -93,6 +109,7 @@ class FullAircraftConfig:
         inference_dir = self._normalize_path(self.inference_dir or (surface_outputs_root / "inference"))
         sensor_dir = self._normalize_path(self.sensor_dir or (surface_outputs_root / "sensor"))
         symbolic_dir = self._normalize_path(self.symbolic_dir or (surface_outputs_root / "symbolic"))
+        diffusion_dir = self._normalize_path(self.diffusion_dir or (surface_outputs_root / "diffusion"))
 
         object.__setattr__(self, "project_root", project_root)
         object.__setattr__(self, "pipeline_root", pipeline_root)
@@ -109,6 +126,7 @@ class FullAircraftConfig:
         object.__setattr__(self, "inference_dir", inference_dir)
         object.__setattr__(self, "sensor_dir", sensor_dir)
         object.__setattr__(self, "symbolic_dir", symbolic_dir)
+        object.__setattr__(self, "diffusion_dir", diffusion_dir)
 
     @staticmethod
     def _normalize_path(path: Path) -> Path:
@@ -170,6 +188,7 @@ class FullAircraftConfig:
             self.inference_dir,
             self.sensor_dir,
             self.symbolic_dir,
+            self.diffusion_dir,
             self.surfaces_dir,
             self.metadata_dir,
         ]:

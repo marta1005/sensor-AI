@@ -6,13 +6,11 @@ import json
 import numpy as np
 import torch
 
+from .cluster_partition import expert_names
 from .config import FullAircraftConfig
 from .features import build_encoder_features, build_expert_features
 from .models import CpExpertNet, FullAircraftLatentMixer, FullAircraftLatentSensorMoE, LegacyLatentSensorMoE
 from .sensor_distillation import apply_hybrid_symbolic_sensor
-
-
-REGIME_NAMES = ["subsonic", "transonic", "supersonic"]
 
 
 def _expert_prediction_path(cfg: FullAircraftConfig, split: str) -> Path:
@@ -96,7 +94,7 @@ def _mach_rule_scores(mach: np.ndarray, sub_max: float, trans_max: float, blend_
 
 
 def _expert_model_paths(cfg: FullAircraftConfig) -> list[Path]:
-    return [cfg.models_dir / f"expert_{name}.pth" for name in REGIME_NAMES]
+    return [cfg.models_dir / f"expert_{name}.pth" for name in expert_names(cfg)]
 
 
 def _load_neural_model(cfg: FullAircraftConfig) -> LegacyLatentSensorMoE | FullAircraftLatentSensorMoE:
@@ -257,7 +255,7 @@ def predict_array(
                 sensor_scores[start:end] = logits_t.detach().cpu().numpy().astype(np.float32)
                 gates[start:end] = gates_t.detach().cpu().numpy().astype(np.float32)
             else:
-                if sensor_artifact.get("type") == "hybrid_linear_band":
+                if sensor_artifact.get("type") in {"hybrid_linear_band", "global_linear_scores"}:
                     score_chunk, gate_chunk = apply_hybrid_symbolic_sensor(x_chunk, sensor_artifact, cfg)
                 elif sensor_artifact.get("type") == "mach_rule":
                     mach = x_chunk[:, 6]

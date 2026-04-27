@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 from numpy.lib.format import open_memmap
 
+from .cluster_partition import load_condition_partition_labels
 from .config import FullAircraftConfig
 from .features import ENCODER_FEATURE_NAMES, EXPERT_FEATURE_NAMES, build_encoder_features, build_expert_features
 from .prepare_data import reduced_paths
@@ -91,6 +92,17 @@ def _transform_split(
     gate_out = open_memmap(paths["gate"], mode="w+", dtype=np.float32, shape=(n_rows, gate_example.shape[1]))
     cp_out = open_memmap(paths["cp"], mode="w+", dtype=np.float32, shape=(n_rows, 1))
     expert_id_out = open_memmap(paths["expert_id"], mode="w+", dtype=np.int64, shape=(n_rows,))
+    if cfg.expert_partition_mode == "mach":
+        condition_ids = None
+        points_per_condition = None
+    else:
+        condition_ids = load_condition_partition_labels(cfg, split)
+        points_per_condition = int(n_rows // max(1, int(condition_ids.shape[0])))
+        if points_per_condition * int(condition_ids.shape[0]) != n_rows:
+            raise ValueError(
+                f"Reduced rows ({n_rows}) are not divisible by condition labels ({condition_ids.shape[0]}) "
+                f"for split={split}."
+            )
 
     for start in range(0, n_rows, batch_rows):
         end = min(n_rows, start + batch_rows)
@@ -99,8 +111,12 @@ def _transform_split(
 
         expert_chunk = build_expert_features(x_chunk)
         gate_chunk = build_encoder_features(x_chunk)
-        mach = x_chunk[:, 6]
-        expert_ids = regime_from_mach(mach, cfg.mach_sub_max, cfg.mach_trans_max)
+        if cfg.expert_partition_mode == "mach":
+            mach = x_chunk[:, 6]
+            expert_ids = regime_from_mach(mach, cfg.mach_sub_max, cfg.mach_trans_max)
+        else:
+            row_condition_idx = (np.arange(start, end, dtype=np.int64) // points_per_condition).astype(np.int64)
+            expert_ids = condition_ids[row_condition_idx]
 
         expert_out[start:end] = _standardize(expert_chunk, expert_mean, expert_scale)
         gate_out[start:end] = _standardize(gate_chunk, gate_mean, gate_scale)
@@ -141,6 +157,10 @@ def prepare_feature_store(cfg: FullAircraftConfig) -> None:
             "expert_feature_names": EXPERT_FEATURE_NAMES,
             "encoder_feature_names": ENCODER_FEATURE_NAMES,
             "reduced_surface": cfg.reduced_surface,
+            "expert_partition_mode": cfg.expert_partition_mode,
+            "cluster_algorithm": cfg.cluster_algorithm,
+            "cluster_count": int(cfg.cluster_count),
+            "hybrid_source_clusters": int(cfg.hybrid_source_clusters),
             "train": train_meta,
             "test": test_meta,
         },

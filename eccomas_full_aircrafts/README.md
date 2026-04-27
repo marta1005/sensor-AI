@@ -13,6 +13,7 @@ Pasar de `260,774` puntos raw por condición a una superficie simplificada y reu
 5. entrenar el teacher latent/MoE
 6. destilar el sensor simbólico
 7. hacer inferencia
+8. opcionalmente, refinar el `Cp` con una rama residual de difusión
 
 ## Comandos
 
@@ -42,6 +43,13 @@ python eccomas_full_aircrafts/main.py distill-sensor
 
 python eccomas_full_aircrafts/main.py infer \
   --mode symbolic
+
+python eccomas_full_aircrafts/main.py train-diffusion \
+  --baseline-mode symbolic
+
+python eccomas_full_aircrafts/main.py infer-diffusion \
+  --split test \
+  --baseline-mode symbolic
 ```
 
 ## Qué queda guardado
@@ -58,6 +66,8 @@ python eccomas_full_aircrafts/main.py infer \
   Sensor simbólico híbrido
 - `outputs/inference/`
   Predicciones `neural` o `symbolic`
+- `outputs/diffusion/`
+  Configuración y artefactos de la rama residual de difusión
 - `results/`
   Figuras de referencia y `Cp fields` raw
 - `exploration_data/`
@@ -67,3 +77,4 @@ python eccomas_full_aircrafts/main.py infer \
 
 - La ruta de entrenamiento actual está pensada para una sola cara de referencia cada vez. El default es `upper`.
 - `plot-raw-fields` ya soporta `points` y `surface`, pero la visualización principal recomendada sigue siendo `points`.
+- `train-diffusion` usa como baseline una predicción `symbolic` o `neural`; si no existe el `.npz` base para `train/test`, lo genera automáticamente con `infer`.

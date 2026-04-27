@@ -14,6 +14,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+from .cluster_partition import expert_names, load_condition_partition_labels
 from .config import FullAircraftConfig
 from .models import FullAircraftExpertUNet
 from .surface_grid import CompactSurfaceGrid
@@ -26,9 +27,6 @@ os.environ.setdefault("MPLCONFIGDIR", str(_PLOT_CACHE / "mpl"))
 os.environ.setdefault("XDG_CACHE_HOME", str(_PLOT_CACHE / "xdg"))
 
 import matplotlib.pyplot as plt
-
-
-REGIME_NAMES = ["subsonic", "transonic", "supersonic"]
 
 
 def _regime_sample_weights(mach: np.ndarray, cfg: FullAircraftConfig, regime_id: int) -> np.ndarray:
@@ -85,7 +83,7 @@ def _expert_model_config_path(cfg: FullAircraftConfig) -> Path:
 @dataclass(frozen=True)
 class _ConditionTable:
     mach: np.ndarray
-    hard_regime: np.ndarray
+    partition_label: np.ndarray
     n_conditions: int
     points_per_condition: int
 
@@ -95,10 +93,18 @@ def _condition_table(cfg: FullAircraftConfig, split: str, grid: CompactSurfaceGr
     x_raw = np.load(x_path, mmap_mode="r")
     n_conditions = int(x_raw.shape[0] // grid.n_points)
     mach = np.asarray(x_raw[:: grid.n_points, 6], dtype=np.float32)[:n_conditions]
-    hard_regime = regime_from_mach(mach, cfg.mach_sub_max, cfg.mach_trans_max)
+    if cfg.expert_partition_mode == "mach":
+        partition_label = regime_from_mach(mach, cfg.mach_sub_max, cfg.mach_trans_max)
+    else:
+        partition_label = load_condition_partition_labels(cfg, split)
+        if partition_label.shape[0] != n_conditions:
+            raise ValueError(
+                f"Condition labels ({partition_label.shape[0]}) do not match reduced conditions ({n_conditions}) "
+                f"for split={split}."
+            )
     return _ConditionTable(
         mach=mach,
-        hard_regime=hard_regime,
+        partition_label=np.asarray(partition_label, dtype=np.int64),
         n_conditions=n_conditions,
         points_per_condition=grid.n_points,
     )
@@ -242,6 +248,10 @@ def _save_predictions(
 def _save_expert_model_config(cfg: FullAircraftConfig, grid: CompactSurfaceGrid, input_channels: int) -> None:
     payload = {
         "expert_model_architecture": cfg.expert_model_architecture,
+        "expert_partition_mode": cfg.expert_partition_mode,
+        "cluster_algorithm": cfg.cluster_algorithm,
+        "cluster_count": int(cfg.cluster_count),
+        "expert_names": expert_names(cfg),
         "input_channels": int(input_channels),
         "base_channels": int(cfg.expert_unet_base_channels),
         "grid_height": int(grid.height),
@@ -261,10 +271,14 @@ def _train_single_regime(
     test_table: _ConditionTable,
     feature_dim: int,
 ) -> None:
-    train_weights_full = _regime_sample_weights(train_table.mach, cfg, regime_id).astype(np.float32)
-    train_condition_idx = np.flatnonzero(train_weights_full > 0.0).astype(np.int64)
-    train_condition_weights = train_weights_full[train_condition_idx]
-    test_condition_idx = np.flatnonzero(test_table.hard_regime == regime_id).astype(np.int64)
+    if cfg.expert_partition_mode == "mach":
+        train_weights_full = _regime_sample_weights(train_table.mach, cfg, regime_id).astype(np.float32)
+        train_condition_idx = np.flatnonzero(train_weights_full > 0.0).astype(np.int64)
+        train_condition_weights = train_weights_full[train_condition_idx]
+    else:
+        train_condition_idx = np.flatnonzero(train_table.partition_label == regime_id).astype(np.int64)
+        train_condition_weights = np.ones(train_condition_idx.shape[0], dtype=np.float32)
+    test_condition_idx = np.flatnonzero(test_table.partition_label == regime_id).astype(np.int64)
 
     train_x_path, train_cp_path, _ = _feature_paths(cfg, "train")
     test_x_path, test_cp_path, _ = _feature_paths(cfg, "test")
@@ -338,6 +352,7 @@ def _train_single_regime(
 
     metrics = {
         "regime": regime_name,
+        "partition_mode": cfg.expert_partition_mode,
         "model_architecture": cfg.expert_model_architecture,
         "train_conditions": int(train_condition_idx.size),
         "train_rows": int(train_condition_idx.size * grid.n_points),
@@ -346,9 +361,10 @@ def _train_single_regime(
         "test_rows": int(test_condition_idx.size * grid.n_points),
         "final_train_smooth_l1": float(history_train[-1]),
         "final_test_smooth_l1": float(history_test[-1]),
-        "overlap_margin": float(cfg.expert_overlap_margin),
-        "overlap_min_weight": float(cfg.expert_overlap_min_weight),
     }
+    if cfg.expert_partition_mode == "mach":
+        metrics["overlap_margin"] = float(cfg.expert_overlap_margin)
+        metrics["overlap_min_weight"] = float(cfg.expert_overlap_min_weight)
     with (cfg.metrics_dir / f"expert_{regime_name}.json").open("w", encoding="utf-8") as handle:
         json.dump(metrics, handle, indent=2)
 
@@ -371,6 +387,9 @@ def _train_single_regime(
 def train_all_experts(cfg: FullAircraftConfig) -> None:
     cfg.ensure_dirs()
     grid = CompactSurfaceGrid.from_reference(cfg)
+    regime_names = expert_names(cfg)
+    if len(regime_names) != cfg.n_experts:
+        raise ValueError(f"Expert name count ({len(regime_names)}) does not match n_experts ({cfg.n_experts}).")
 
     train_x_path, _, _ = _feature_paths(cfg, "train")
     feature_dim = int(np.load(train_x_path, mmap_mode="r").shape[1])
@@ -385,7 +404,7 @@ def train_all_experts(cfg: FullAircraftConfig) -> None:
 
     _save_expert_model_config(cfg, grid, feature_dim + 1)
 
-    for regime_id, regime_name in enumerate(REGIME_NAMES):
+    for regime_id, regime_name in enumerate(regime_names):
         _train_single_regime(
             cfg=cfg,
             regime_id=regime_id,

@@ -71,6 +71,12 @@ class FullAircraftConfig:
     mach_trans_max: float = 0.85
     expert_overlap_margin: float = 0.05
     expert_overlap_min_weight: float = 0.25
+    positive_branch_focus_mach_max: float = 0.55
+    positive_branch_focus_aoa_deg: float = 7.5
+    positive_branch_focus_weight: float = 2.5
+    positive_branch_extreme_mach_max: float = 0.35
+    positive_branch_extreme_aoa_deg: float = 10.0
+    positive_branch_extreme_weight: float = 4.0
 
     plot_sample_size: int = 40_000
     latent_plot_sample_size: int = 120_000

@@ -83,6 +83,7 @@ def _expert_model_config_path(cfg: FullAircraftConfig) -> Path:
 @dataclass(frozen=True)
 class _ConditionTable:
     mach: np.ndarray
+    aoa_deg: np.ndarray
     partition_label: np.ndarray
     n_conditions: int
     points_per_condition: int
@@ -93,6 +94,7 @@ def _condition_table(cfg: FullAircraftConfig, split: str, grid: CompactSurfaceGr
     x_raw = np.load(x_path, mmap_mode="r")
     n_conditions = int(x_raw.shape[0] // grid.n_points)
     mach = np.asarray(x_raw[:: grid.n_points, 6], dtype=np.float32)[:n_conditions]
+    aoa_deg = np.asarray(x_raw[:: grid.n_points, 7], dtype=np.float32)[:n_conditions]
     if cfg.expert_partition_mode == "mach":
         partition_label = regime_from_mach(mach, cfg.mach_sub_max, cfg.mach_trans_max)
     else:
@@ -104,10 +106,32 @@ def _condition_table(cfg: FullAircraftConfig, split: str, grid: CompactSurfaceGr
             )
     return _ConditionTable(
         mach=mach,
+        aoa_deg=aoa_deg,
         partition_label=np.asarray(partition_label, dtype=np.int64),
         n_conditions=n_conditions,
         points_per_condition=grid.n_points,
     )
+
+
+def _hybrid_positive_branch_weights(
+    cfg: FullAircraftConfig,
+    regime_name: str,
+    train_table: _ConditionTable,
+    condition_indices: np.ndarray,
+) -> np.ndarray:
+    weights = np.ones(condition_indices.shape[0], dtype=np.float32)
+    if cfg.expert_partition_mode != "hybrid" or regime_name != "positive_branch" or condition_indices.size == 0:
+        return weights
+
+    mach = train_table.mach[condition_indices]
+    aoa_deg = train_table.aoa_deg[condition_indices]
+
+    focus_mask = (mach <= cfg.positive_branch_focus_mach_max) & (aoa_deg >= cfg.positive_branch_focus_aoa_deg)
+    extreme_mask = (mach <= cfg.positive_branch_extreme_mach_max) & (aoa_deg >= cfg.positive_branch_extreme_aoa_deg)
+
+    weights[focus_mask] = np.maximum(weights[focus_mask], np.float32(cfg.positive_branch_focus_weight))
+    weights[extreme_mask] = np.maximum(weights[extreme_mask], np.float32(cfg.positive_branch_extreme_weight))
+    return weights
 
 
 class _FieldConditionDataset(Dataset):
@@ -277,8 +301,18 @@ def _train_single_regime(
         train_condition_weights = train_weights_full[train_condition_idx]
     else:
         train_condition_idx = np.flatnonzero(train_table.partition_label == regime_id).astype(np.int64)
-        train_condition_weights = np.ones(train_condition_idx.shape[0], dtype=np.float32)
+        train_condition_weights = _hybrid_positive_branch_weights(cfg, regime_name, train_table, train_condition_idx)
     test_condition_idx = np.flatnonzero(test_table.partition_label == regime_id).astype(np.int64)
+
+    positive_focus_count = 0
+    positive_extreme_count = 0
+    if cfg.expert_partition_mode == "hybrid" and regime_name == "positive_branch" and train_condition_idx.size > 0:
+        mach = train_table.mach[train_condition_idx]
+        aoa_deg = train_table.aoa_deg[train_condition_idx]
+        focus_mask = (mach <= cfg.positive_branch_focus_mach_max) & (aoa_deg >= cfg.positive_branch_focus_aoa_deg)
+        extreme_mask = (mach <= cfg.positive_branch_extreme_mach_max) & (aoa_deg >= cfg.positive_branch_extreme_aoa_deg)
+        positive_focus_count = int(focus_mask.sum())
+        positive_extreme_count = int(extreme_mask.sum())
 
     train_x_path, train_cp_path, _ = _feature_paths(cfg, "train")
     test_x_path, test_cp_path, _ = _feature_paths(cfg, "test")
@@ -313,8 +347,16 @@ def _train_single_regime(
     print(
         f"[train-experts] start {regime_name}: "
         f"train_conditions={train_condition_idx.size:,}, test_conditions={test_condition_idx.size:,}, "
-        f"grid={grid.height}x{grid.width}, device={cfg.device}"
+        f"grid={grid.height}x{grid.width}, device={cfg.device}, "
+        f"train_weight_sum={train_condition_weights.sum():.1f}"
     )
+    if cfg.expert_partition_mode == "hybrid" and regime_name == "positive_branch":
+        print(
+            f"[train-experts] positive_branch focus cases={positive_focus_count:,} "
+            f"(w={cfg.positive_branch_focus_weight:.2f}), "
+            f"extreme cases={positive_extreme_count:,} "
+            f"(w={cfg.positive_branch_extreme_weight:.2f})"
+        )
 
     for epoch in range(1, cfg.expert_epochs + 1):
         model.train()
@@ -365,6 +407,15 @@ def _train_single_regime(
     if cfg.expert_partition_mode == "mach":
         metrics["overlap_margin"] = float(cfg.expert_overlap_margin)
         metrics["overlap_min_weight"] = float(cfg.expert_overlap_min_weight)
+    if cfg.expert_partition_mode == "hybrid" and regime_name == "positive_branch":
+        metrics["positive_branch_focus_mach_max"] = float(cfg.positive_branch_focus_mach_max)
+        metrics["positive_branch_focus_aoa_deg"] = float(cfg.positive_branch_focus_aoa_deg)
+        metrics["positive_branch_focus_weight"] = float(cfg.positive_branch_focus_weight)
+        metrics["positive_branch_extreme_mach_max"] = float(cfg.positive_branch_extreme_mach_max)
+        metrics["positive_branch_extreme_aoa_deg"] = float(cfg.positive_branch_extreme_aoa_deg)
+        metrics["positive_branch_extreme_weight"] = float(cfg.positive_branch_extreme_weight)
+        metrics["positive_branch_focus_case_count"] = int(positive_focus_count)
+        metrics["positive_branch_extreme_case_count"] = int(positive_extreme_count)
     with (cfg.metrics_dir / f"expert_{regime_name}.json").open("w", encoding="utf-8") as handle:
         json.dump(metrics, handle, indent=2)
 

@@ -16,6 +16,7 @@ from tqdm import tqdm
 
 from .cluster_partition import expert_names, load_condition_partition_labels
 from .config import FullAircraftConfig
+from .expert_diagnostics import diagnose_experts
 from .models import FullAircraftExpertUNet
 from .surface_grid import CompactSurfaceGrid
 from .utils import regime_from_mach
@@ -510,4 +511,5 @@ def train_all_experts(cfg: FullAircraftConfig) -> None:
             feature_dim=feature_dim,
         )
 
+    diagnose_experts(cfg, splits=("train", "test"))
     print(f"[train-experts] Finished. U-Net experts stored in {cfg.models_dir}")

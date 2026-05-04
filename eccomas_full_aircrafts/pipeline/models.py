@@ -201,6 +201,41 @@ class FullAircraftExpertUNet(nn.Module):
         return self.head(x)
 
 
+class FullAircraftShockSplitUNet(nn.Module):
+    """Shared global backbone with two local experts: smooth-flow and shock-flow."""
+
+    def __init__(self, input_channels: int, base_channels: int = 16):
+        super().__init__()
+        c1 = base_channels
+        c2 = c1 * 2
+        c3 = c2 * 2
+        c4 = c3 * 2
+
+        self.in_block = _ConvBlock(input_channels, c1)
+        self.down1 = _DownBlock(c1, c2)
+        self.down2 = _DownBlock(c2, c3)
+        self.down3 = _DownBlock(c3, c4)
+        self.bottleneck = _ConvBlock(c4, c4)
+        self.up3 = _UpBlock(c4, c4, c3)
+        self.up2 = _UpBlock(c3, c3, c2)
+        self.up1 = _UpBlock(c2, c2, c1)
+        self.head = nn.Conv2d(c1, 2, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        s1 = self.in_block(x)
+        s2 = self.down1(s1)
+        s3 = self.down2(s2)
+        s4 = self.down3(s3)
+        b = self.bottleneck(s4)
+        x = self.up3(b, s4)
+        x = self.up2(x, s3)
+        x = self.up1(x, s2)
+        x = F.interpolate(x, size=s1.shape[-2:], mode="bilinear", align_corners=False)
+        x = x + s1
+        heads = self.head(x)
+        return heads[:, 0:1], heads[:, 1:2]
+
+
 class FullAircraftLatentMixer(nn.Module):
     def __init__(self, gate_input_dim: int, latent_dim: int, n_experts: int):
         super().__init__()

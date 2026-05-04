@@ -89,6 +89,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser(
+        "train-shock-experts",
+        parents=[common],
+        help="Train a shared global U-Net with smooth/shock expert heads over the reduced full-aircraft field",
+    )
+
+    subparsers.add_parser(
+        "distill-shock-sensor",
+        parents=[common],
+        help="Fit a symbolic local shock sensor directly from gradient-derived shock targets",
+    )
+
+    shock_infer_parser = subparsers.add_parser(
+        "infer-shock-symbolic",
+        parents=[common],
+        help="Infer Cp with the smooth/shock experts mixed by the symbolic local shock sensor",
+    )
+    shock_infer_parser.add_argument("--input-path", type=str, default=None)
+    shock_infer_parser.add_argument("--output-path", type=str, default=None)
+    shock_infer_parser.add_argument("--max-rows", type=int, default=None)
+
+    diagnose_experts_parser = subparsers.add_parser(
+        "diagnose-experts",
+        parents=[common],
+        help="Evaluate whether each expert is strongest on its own partition and summarize partition quality",
+    )
+    diagnose_experts_parser.add_argument("--splits", type=str, nargs="+", choices=["train", "test"], default=["train", "test"])
+
+    subparsers.add_parser(
         "train-latent",
         parents=[common],
         help="Train the latent gate/MoE teacher over the reduced full-aircraft features",
@@ -251,6 +279,29 @@ def main() -> None:
         from eccomas_full_aircrafts.pipeline.train_experts import train_all_experts
 
         train_all_experts(cfg)
+    elif args.command == "train-shock-experts":
+        from eccomas_full_aircrafts.pipeline.shock_local_pipeline import train_shock_experts
+
+        train_shock_experts(cfg)
+    elif args.command == "distill-shock-sensor":
+        from eccomas_full_aircrafts.pipeline.shock_local_pipeline import distill_shock_sensor
+
+        distill_shock_sensor(cfg)
+    elif args.command == "infer-shock-symbolic":
+        from eccomas_full_aircrafts.pipeline.shock_local_pipeline import infer_shock_symbolic
+
+        input_path = Path(args.input_path).expanduser().resolve() if args.input_path else None
+        output_path = Path(args.output_path).expanduser().resolve() if args.output_path else None
+        infer_shock_symbolic(
+            cfg,
+            input_path=input_path,
+            output_path=output_path,
+            max_rows=args.max_rows,
+        )
+    elif args.command == "diagnose-experts":
+        from eccomas_full_aircrafts.pipeline.expert_diagnostics import diagnose_experts
+
+        diagnose_experts(cfg, splits=tuple(args.splits))
     elif args.command == "train-latent":
         from eccomas_full_aircrafts.pipeline.train_latent import train_latent_pipeline
 

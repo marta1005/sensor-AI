@@ -93,6 +93,18 @@ class FullAircraftConfig:
     diffusion_cond_feature_dim: int = 15
     diffusion_shock_weight: float = 2.0
 
+    shock_local_base_channels: int = 16
+    shock_local_epochs: int = 80
+    shock_local_lr: float = 1e-3
+    shock_local_target_quantile: float = 0.95
+    shock_local_binary_threshold: float = 0.50
+    shock_local_mixed_loss_weight: float = 1.0
+    shock_local_smooth_head_weight: float = 0.35
+    shock_local_shock_head_weight: float = 0.65
+    shock_local_grad_loss_weight: float = 0.20
+    shock_symbolic_max_samples: int = 250_000
+    shock_symbolic_ridge_alpha: float = 1e-2
+
     def __post_init__(self) -> None:
         default_project_root = Path(__file__).resolve().parents[2]
         project_root = self._normalize_path(self.project_root or default_project_root)

@@ -252,6 +252,110 @@ class FullAircraftShockSplitUNet(nn.Module):
         return heads[:, 0:1], heads[:, 1:2], alpha_logits, latent
 
 
+class _MeshMessagePassingLayer(nn.Module):
+    def __init__(self, hidden_dim: int, edge_dim: int, dropout: float = 0.05):
+        super().__init__()
+        self.message_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + edge_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+        )
+        self.update_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.out_norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, x: torch.Tensor, edge_src: torch.Tensor, edge_dst: torch.Tensor, edge_attr: torch.Tensor) -> torch.Tensor:
+        batch, n_nodes, hidden_dim = x.shape
+        n_edges = int(edge_src.shape[0])
+        src_state = x[:, edge_src, :]
+        dst_state = x[:, edge_dst, :]
+        edge_feat = edge_attr.unsqueeze(0).expand(batch, n_edges, edge_attr.shape[1])
+        msg_in = torch.cat([src_state, dst_state, edge_feat], dim=-1)
+        msg = self.message_mlp(msg_in)
+
+        agg = x.new_zeros((batch, n_nodes, hidden_dim))
+        batch_offsets = (torch.arange(batch, device=x.device, dtype=torch.long).view(batch, 1) * n_nodes)
+        flat_dst = (edge_dst.view(1, n_edges) + batch_offsets).reshape(-1)
+        agg_flat = agg.reshape(batch * n_nodes, hidden_dim)
+        agg_flat.index_add_(0, flat_dst, msg.reshape(batch * n_edges, hidden_dim))
+        agg = agg_flat.view(batch, n_nodes, hidden_dim)
+
+        updated = self.update_mlp(torch.cat([x, agg], dim=-1))
+        return self.out_norm(x + updated)
+
+
+class FullAircraftMeshTeacher(nn.Module):
+    """Graph teacher with a local latent bottleneck and smooth/shock heads."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int = 96,
+        latent_dim: int = 4,
+        edge_dim: int = 6,
+        message_passing_steps: int = 6,
+        dropout: float = 0.05,
+    ):
+        super().__init__()
+        self.node_encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+        )
+        self.layers = nn.ModuleList(
+            [_MeshMessagePassingLayer(hidden_dim=hidden_dim, edge_dim=edge_dim, dropout=dropout) for _ in range(message_passing_steps)]
+        )
+        self.to_latent = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, latent_dim),
+        )
+        self.alpha_head = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.SiLU(),
+            nn.Linear(latent_dim, 1),
+        )
+        head_input_dim = hidden_dim + latent_dim
+        self.smooth_head = nn.Sequential(
+            nn.Linear(head_input_dim, hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+        self.shock_head = nn.Sequential(
+            nn.Linear(head_input_dim, hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(
+        self,
+        node_features: torch.Tensor,
+        edge_src: torch.Tensor,
+        edge_dst: torch.Tensor,
+        edge_attr: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden = self.node_encoder(node_features)
+        for layer in self.layers:
+            hidden = layer(hidden, edge_src=edge_src, edge_dst=edge_dst, edge_attr=edge_attr)
+        latent = self.to_latent(hidden)
+        alpha_logits = self.alpha_head(latent)
+        head_input = torch.cat([hidden, latent], dim=-1)
+        smooth = self.smooth_head(head_input)
+        shock = self.shock_head(head_input)
+        return smooth, shock, alpha_logits, latent
+
+
 class FullAircraftLatentMixer(nn.Module):
     def __init__(self, gate_input_dim: int, latent_dim: int, n_experts: int):
         super().__init__()

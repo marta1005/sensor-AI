@@ -46,6 +46,16 @@ python eccomas_full_aircrafts/main.py distill-shock-sensor \
 
 python eccomas_full_aircrafts/main.py infer-shock-symbolic \
   --reduced-surface upper
+
+# Ruta alternativa: MeshGraphNet teacher + sensor simbólico
+python eccomas_full_aircrafts/main.py train-mesh-teacher \
+  --reduced-surface upper
+
+python eccomas_full_aircrafts/main.py distill-mesh-sensor \
+  --reduced-surface upper
+
+python eccomas_full_aircrafts/main.py infer-mesh-symbolic \
+  --reduced-surface upper
 ```
 
 ## Qué se guarda
@@ -92,4 +102,6 @@ Si no pasas `--prediction-path`, los plots buscan por defecto:
 
 ## Nota práctica
 
-La lectura importante del sensor simbólico ya no es “qué experto global elijo para una condición”, sino “dónde aparece una región de choque en la superficie y cuánto debe mandar la cabeza `shock` frente a la `smooth`”.
+La lectura importante del sensor simbólico ya no es "qué experto global elijo para una condición", sino "dónde aparece una región de choque en la superficie y cuánto debe mandar la cabeza `shock` frente a la `smooth`".
+
+En la ruta `mesh`, el `teacher` trabaja directamente sobre un grafo fijo construido a partir de la superficie reducida y expone un `alpha_teacher` local con cuello latente, que luego se destila a un sensor simbólico.

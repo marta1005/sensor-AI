@@ -106,6 +106,22 @@ class FullAircraftConfig:
     shock_symbolic_max_samples: int = 250_000
     shock_symbolic_ridge_alpha: float = 1e-2
 
+    mesh_teacher_hidden_dim: int = 96
+    mesh_teacher_message_passing_steps: int = 6
+    mesh_teacher_dropout: float = 0.05
+    mesh_teacher_lr: float = 1e-3
+    mesh_teacher_epochs: int = 80
+    mesh_teacher_batch_size: int = 2
+    mesh_teacher_shock_quantile: float = 0.95
+    mesh_teacher_binary_threshold: float = 0.50
+    mesh_teacher_mixed_loss_weight: float = 1.0
+    mesh_teacher_smooth_head_weight: float = 0.35
+    mesh_teacher_shock_head_weight: float = 0.65
+    mesh_teacher_alpha_loss_weight: float = 0.30
+    mesh_teacher_grad_loss_weight: float = 0.20
+    mesh_symbolic_max_samples: int = 250_000
+    mesh_symbolic_ridge_alpha: float = 1e-2
+
     def __post_init__(self) -> None:
         default_project_root = Path(__file__).resolve().parents[2]
         project_root = self._normalize_path(self.project_root or default_project_root)

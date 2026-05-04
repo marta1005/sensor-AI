@@ -63,9 +63,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser(
+        "train-mesh-teacher",
+        parents=[common],
+        help="Train a MeshGraphNet-style teacher with a local latent bottleneck and smooth/shock heads",
+    )
+
+    subparsers.add_parser(
         "distill-shock-sensor",
         parents=[common],
         help="Distill the latent local shock teacher into a symbolic local shock sensor",
+    )
+
+    subparsers.add_parser(
+        "distill-mesh-sensor",
+        parents=[common],
+        help="Distill the MeshGraphNet teacher alpha into a symbolic local shock sensor",
     )
 
     shock_infer_parser = subparsers.add_parser(
@@ -76,6 +88,15 @@ def build_parser() -> argparse.ArgumentParser:
     shock_infer_parser.add_argument("--input-path", type=str, default=None)
     shock_infer_parser.add_argument("--output-path", type=str, default=None)
     shock_infer_parser.add_argument("--max-rows", type=int, default=None)
+
+    mesh_infer_parser = subparsers.add_parser(
+        "infer-mesh-symbolic",
+        parents=[common],
+        help="Infer Cp with the MeshGraphNet teacher heads mixed by the symbolic local sensor",
+    )
+    mesh_infer_parser.add_argument("--input-path", type=str, default=None)
+    mesh_infer_parser.add_argument("--output-path", type=str, default=None)
+    mesh_infer_parser.add_argument("--max-rows", type=int, default=None)
 
     field_parser = subparsers.add_parser(
         "plot-raw-fields",
@@ -193,16 +214,35 @@ def main() -> None:
         from eccomas_full_aircrafts.pipeline.shock_local_pipeline import train_shock_experts
 
         train_shock_experts(cfg)
+    elif args.command == "train-mesh-teacher":
+        from eccomas_full_aircrafts.pipeline.mesh_teacher_pipeline import train_mesh_teacher
+
+        train_mesh_teacher(cfg)
     elif args.command == "distill-shock-sensor":
         from eccomas_full_aircrafts.pipeline.shock_local_pipeline import distill_shock_sensor
 
         distill_shock_sensor(cfg)
+    elif args.command == "distill-mesh-sensor":
+        from eccomas_full_aircrafts.pipeline.mesh_teacher_pipeline import distill_mesh_sensor
+
+        distill_mesh_sensor(cfg)
     elif args.command == "infer-shock-symbolic":
         from eccomas_full_aircrafts.pipeline.shock_local_pipeline import infer_shock_symbolic
 
         input_path = Path(args.input_path).expanduser().resolve() if args.input_path else None
         output_path = Path(args.output_path).expanduser().resolve() if args.output_path else None
         infer_shock_symbolic(
+            cfg,
+            input_path=input_path,
+            output_path=output_path,
+            max_rows=args.max_rows,
+        )
+    elif args.command == "infer-mesh-symbolic":
+        from eccomas_full_aircrafts.pipeline.mesh_teacher_pipeline import infer_mesh_symbolic
+
+        input_path = Path(args.input_path).expanduser().resolve() if args.input_path else None
+        output_path = Path(args.output_path).expanduser().resolve() if args.output_path else None
+        infer_mesh_symbolic(
             cfg,
             input_path=input_path,
             output_path=output_path,

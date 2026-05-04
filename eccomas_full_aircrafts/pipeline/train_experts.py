@@ -83,7 +83,6 @@ def _expert_model_config_path(cfg: FullAircraftConfig) -> Path:
 @dataclass(frozen=True)
 class _ConditionTable:
     mach: np.ndarray
-    aoa_deg: np.ndarray
     partition_label: np.ndarray
     n_conditions: int
     points_per_condition: int
@@ -94,7 +93,6 @@ def _condition_table(cfg: FullAircraftConfig, split: str, grid: CompactSurfaceGr
     x_raw = np.load(x_path, mmap_mode="r")
     n_conditions = int(x_raw.shape[0] // grid.n_points)
     mach = np.asarray(x_raw[:: grid.n_points, 6], dtype=np.float32)[:n_conditions]
-    aoa_deg = np.asarray(x_raw[:: grid.n_points, 7], dtype=np.float32)[:n_conditions]
     if cfg.expert_partition_mode == "mach":
         partition_label = regime_from_mach(mach, cfg.mach_sub_max, cfg.mach_trans_max)
     else:
@@ -106,32 +104,10 @@ def _condition_table(cfg: FullAircraftConfig, split: str, grid: CompactSurfaceGr
             )
     return _ConditionTable(
         mach=mach,
-        aoa_deg=aoa_deg,
         partition_label=np.asarray(partition_label, dtype=np.int64),
         n_conditions=n_conditions,
         points_per_condition=grid.n_points,
     )
-
-
-def _hybrid_positive_branch_weights(
-    cfg: FullAircraftConfig,
-    regime_name: str,
-    train_table: _ConditionTable,
-    condition_indices: np.ndarray,
-) -> np.ndarray:
-    weights = np.ones(condition_indices.shape[0], dtype=np.float32)
-    if cfg.expert_partition_mode != "hybrid" or regime_name != "positive_branch" or condition_indices.size == 0:
-        return weights
-
-    mach = train_table.mach[condition_indices]
-    aoa_deg = train_table.aoa_deg[condition_indices]
-
-    focus_mask = (mach <= cfg.positive_branch_focus_mach_max) & (aoa_deg >= cfg.positive_branch_focus_aoa_deg)
-    extreme_mask = (mach <= cfg.positive_branch_extreme_mach_max) & (aoa_deg >= cfg.positive_branch_extreme_aoa_deg)
-
-    weights[focus_mask] = np.maximum(weights[focus_mask], np.float32(cfg.positive_branch_focus_weight))
-    weights[extreme_mask] = np.maximum(weights[extreme_mask], np.float32(cfg.positive_branch_extreme_weight))
-    return weights
 
 
 class _FieldConditionDataset(Dataset):
@@ -191,6 +167,80 @@ def _masked_weighted_smooth_l1(
     per_sample = loss.flatten(1).sum(dim=1) / denom
     weights = sample_weight.reshape(-1).clamp_min(1e-8)
     return (per_sample * weights).sum() / weights.sum()
+
+
+def _finite_diff_x(field: torch.Tensor) -> torch.Tensor:
+    return F.pad(field[..., 1:] - field[..., :-1], (0, 1, 0, 0))
+
+
+def _finite_diff_y(field: torch.Tensor) -> torch.Tensor:
+    return F.pad(field[..., 1:, :] - field[..., :-1, :], (0, 0, 0, 1))
+
+
+def _shock_weight_map(target: torch.Tensor, mask: torch.Tensor, cfg: FullAircraftConfig) -> torch.Tensor:
+    if cfg.expert_shock_weight <= 0.0:
+        return mask
+
+    grad_x = _finite_diff_x(target)
+    grad_y = _finite_diff_y(target)
+    grad_mag = torch.sqrt(grad_x.square() + grad_y.square() + 1e-12) * mask
+    flat_grad = grad_mag.flatten(1)
+    flat_mask = mask.flatten(1) > 0.5
+    scales: list[torch.Tensor] = []
+    for idx in range(target.shape[0]):
+        valid = flat_grad[idx][flat_mask[idx]]
+        if valid.numel() == 0:
+            scales.append(torch.ones((), device=target.device, dtype=target.dtype))
+            continue
+        scale = torch.quantile(valid, q=float(cfg.expert_shock_quantile)).clamp_min(1e-6)
+        scales.append(scale)
+    scale = torch.stack(scales).view(-1, 1, 1, 1)
+    normalized = torch.clamp(grad_mag / scale, 0.0, 1.0)
+    return (1.0 + float(cfg.expert_shock_weight) * normalized) * mask
+
+
+def _masked_average_smooth_l1(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    loss = F.smooth_l1_loss(pred, target, reduction="none") * mask
+    denom = mask.flatten(1).sum(dim=1).clamp_min(1.0)
+    return (loss.flatten(1).sum(dim=1) / denom).mean()
+
+
+def _shock_aware_expert_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    sample_weight: torch.Tensor,
+    cfg: FullAircraftConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    shock_weight = _shock_weight_map(target, mask, cfg)
+
+    cp_loss_map = F.smooth_l1_loss(pred, target, reduction="none") * shock_weight
+    cp_denom = shock_weight.flatten(1).sum(dim=1).clamp_min(1.0)
+    cp_per_sample = cp_loss_map.flatten(1).sum(dim=1) / cp_denom
+
+    pred_dx = _finite_diff_x(pred)
+    pred_dy = _finite_diff_y(pred)
+    target_dx = _finite_diff_x(target)
+    target_dy = _finite_diff_y(target)
+    mask_dx = F.pad(mask[..., 1:] * mask[..., :-1], (0, 1, 0, 0))
+    mask_dy = F.pad(mask[..., 1:, :] * mask[..., :-1, :], (0, 0, 0, 1))
+    weight_dx = shock_weight * mask_dx
+    weight_dy = shock_weight * mask_dy
+
+    grad_dx = F.smooth_l1_loss(pred_dx, target_dx, reduction="none") * weight_dx
+    grad_dy = F.smooth_l1_loss(pred_dy, target_dy, reduction="none") * weight_dy
+    grad_dx_denom = weight_dx.flatten(1).sum(dim=1).clamp_min(1.0)
+    grad_dy_denom = weight_dy.flatten(1).sum(dim=1).clamp_min(1.0)
+    grad_per_sample = 0.5 * (
+        grad_dx.flatten(1).sum(dim=1) / grad_dx_denom +
+        grad_dy.flatten(1).sum(dim=1) / grad_dy_denom
+    )
+
+    weights = sample_weight.reshape(-1).clamp_min(1e-8)
+    cp_loss = (cp_per_sample * weights).sum() / weights.sum()
+    grad_loss = (grad_per_sample * weights).sum() / weights.sum()
+    total_loss = cp_loss + float(cfg.expert_gradient_loss_weight) * grad_loss
+    return total_loss, cp_loss, grad_loss
 
 
 def _evaluate(model: FullAircraftExpertUNet, loader: DataLoader, device: torch.device) -> dict[str, float]:
@@ -301,18 +351,8 @@ def _train_single_regime(
         train_condition_weights = train_weights_full[train_condition_idx]
     else:
         train_condition_idx = np.flatnonzero(train_table.partition_label == regime_id).astype(np.int64)
-        train_condition_weights = _hybrid_positive_branch_weights(cfg, regime_name, train_table, train_condition_idx)
+        train_condition_weights = np.ones(train_condition_idx.shape[0], dtype=np.float32)
     test_condition_idx = np.flatnonzero(test_table.partition_label == regime_id).astype(np.int64)
-
-    positive_focus_count = 0
-    positive_extreme_count = 0
-    if cfg.expert_partition_mode == "hybrid" and regime_name == "positive_branch" and train_condition_idx.size > 0:
-        mach = train_table.mach[train_condition_idx]
-        aoa_deg = train_table.aoa_deg[train_condition_idx]
-        focus_mask = (mach <= cfg.positive_branch_focus_mach_max) & (aoa_deg >= cfg.positive_branch_focus_aoa_deg)
-        extreme_mask = (mach <= cfg.positive_branch_extreme_mach_max) & (aoa_deg >= cfg.positive_branch_extreme_aoa_deg)
-        positive_focus_count = int(focus_mask.sum())
-        positive_extreme_count = int(extreme_mask.sum())
 
     train_x_path, train_cp_path, _ = _feature_paths(cfg, "train")
     test_x_path, test_cp_path, _ = _feature_paths(cfg, "test")
@@ -343,6 +383,7 @@ def _train_single_regime(
 
     history_train: list[float] = []
     history_test: list[float] = []
+    history_train_objective: list[float] = []
 
     print(
         f"[train-experts] start {regime_name}: "
@@ -350,18 +391,16 @@ def _train_single_regime(
         f"grid={grid.height}x{grid.width}, device={cfg.device}, "
         f"train_weight_sum={train_condition_weights.sum():.1f}"
     )
-    if cfg.expert_partition_mode == "hybrid" and regime_name == "positive_branch":
-        print(
-            f"[train-experts] positive_branch focus cases={positive_focus_count:,} "
-            f"(w={cfg.positive_branch_focus_weight:.2f}), "
-            f"extreme cases={positive_extreme_count:,} "
-            f"(w={cfg.positive_branch_extreme_weight:.2f})"
-        )
+    print(
+        f"[train-experts] shock-aware loss: shock_weight={cfg.expert_shock_weight:.2f}, "
+        f"shock_q={cfg.expert_shock_quantile:.2f}, grad_lambda={cfg.expert_gradient_loss_weight:.2f}"
+    )
 
     for epoch in range(1, cfg.expert_epochs + 1):
         model.train()
-        total_weighted = 0.0
-        total_weight = 0.0
+        total_objective = 0.0
+        total_s1 = 0.0
+        total_samples = 0
         pbar = tqdm(train_loader, desc=f"[expert-unet:{regime_name}] epoch {epoch}/{cfg.expert_epochs}")
         for feat, cp, mask, weight in pbar:
             feat = feat.to(cfg.device, non_blocking=True)
@@ -371,22 +410,32 @@ def _train_single_regime(
 
             optimizer.zero_grad(set_to_none=True)
             pred = model(feat)
-            loss = _masked_weighted_smooth_l1(pred, cp, mask, weight)
+            loss, cp_loss, grad_loss = _shock_aware_expert_loss(pred, cp, mask, weight, cfg)
+            metric_s1 = _masked_average_smooth_l1(pred.detach(), cp, mask)
             loss.backward()
             optimizer.step()
 
-            total_weighted += loss.item() * float(weight.sum().item())
-            total_weight += float(weight.sum().item())
-            pbar.set_postfix(loss=f"{loss.item():.5f}")
+            batch_samples = pred.shape[0]
+            total_objective += loss.item() * batch_samples
+            total_s1 += metric_s1.item() * batch_samples
+            total_samples += batch_samples
+            pbar.set_postfix(
+                loss=f"{loss.item():.5f}",
+                cp=f"{cp_loss.item():.5f}",
+                grad=f"{grad_loss.item():.5f}",
+            )
 
         scheduler.step()
-        train_loss = total_weighted / max(1e-8, total_weight)
+        train_objective = total_objective / max(1, total_samples)
+        train_s1 = total_s1 / max(1, total_samples)
         test_metrics = _evaluate(model, test_loader, cfg.device)
-        history_train.append(train_loss)
+        history_train.append(train_s1)
         history_test.append(test_metrics["smooth_l1"])
+        history_train_objective.append(train_objective)
         print(
-            f"[expert-unet:{regime_name}] epoch {epoch:03d} | train={train_loss:.6f} | "
-            f"test={test_metrics['smooth_l1']:.6f} | rmse_norm={test_metrics['rmse_norm']:.6f}"
+            f"[expert-unet:{regime_name}] epoch {epoch:03d} | train_s1={train_s1:.6f} | "
+            f"train_obj={train_objective:.6f} | test={test_metrics['smooth_l1']:.6f} | "
+            f"rmse_norm={test_metrics['rmse_norm']:.6f}"
         )
 
     model_path = cfg.models_dir / f"expert_{regime_name}.pth"
@@ -402,20 +451,15 @@ def _train_single_regime(
         "test_conditions": int(test_condition_idx.size),
         "test_rows": int(test_condition_idx.size * grid.n_points),
         "final_train_smooth_l1": float(history_train[-1]),
+        "final_train_objective": float(history_train_objective[-1]),
         "final_test_smooth_l1": float(history_test[-1]),
+        "expert_shock_weight": float(cfg.expert_shock_weight),
+        "expert_shock_quantile": float(cfg.expert_shock_quantile),
+        "expert_gradient_loss_weight": float(cfg.expert_gradient_loss_weight),
     }
     if cfg.expert_partition_mode == "mach":
         metrics["overlap_margin"] = float(cfg.expert_overlap_margin)
         metrics["overlap_min_weight"] = float(cfg.expert_overlap_min_weight)
-    if cfg.expert_partition_mode == "hybrid" and regime_name == "positive_branch":
-        metrics["positive_branch_focus_mach_max"] = float(cfg.positive_branch_focus_mach_max)
-        metrics["positive_branch_focus_aoa_deg"] = float(cfg.positive_branch_focus_aoa_deg)
-        metrics["positive_branch_focus_weight"] = float(cfg.positive_branch_focus_weight)
-        metrics["positive_branch_extreme_mach_max"] = float(cfg.positive_branch_extreme_mach_max)
-        metrics["positive_branch_extreme_aoa_deg"] = float(cfg.positive_branch_extreme_aoa_deg)
-        metrics["positive_branch_extreme_weight"] = float(cfg.positive_branch_extreme_weight)
-        metrics["positive_branch_focus_case_count"] = int(positive_focus_count)
-        metrics["positive_branch_extreme_case_count"] = int(positive_extreme_count)
     with (cfg.metrics_dir / f"expert_{regime_name}.json").open("w", encoding="utf-8") as handle:
         json.dump(metrics, handle, indent=2)
 

@@ -202,9 +202,9 @@ class FullAircraftExpertUNet(nn.Module):
 
 
 class FullAircraftShockSplitUNet(nn.Module):
-    """Shared global backbone with two local experts: smooth-flow and shock-flow."""
+    """Shared global backbone with a compact latent bottleneck and two local experts."""
 
-    def __init__(self, input_channels: int, base_channels: int = 16):
+    def __init__(self, input_channels: int, base_channels: int = 16, latent_dim: int = 4):
         super().__init__()
         c1 = base_channels
         c2 = c1 * 2
@@ -216,24 +216,40 @@ class FullAircraftShockSplitUNet(nn.Module):
         self.down2 = _DownBlock(c2, c3)
         self.down3 = _DownBlock(c3, c4)
         self.bottleneck = _ConvBlock(c4, c4)
+        self.to_latent = nn.Conv2d(c4, latent_dim, kernel_size=1)
+        self.from_latent = nn.Sequential(
+            nn.Conv2d(latent_dim, c4, kernel_size=1, bias=False),
+            nn.GroupNorm(_group_count(c4), c4),
+            nn.SiLU(),
+        )
+        self.alpha_head = nn.Sequential(
+            nn.Conv2d(latent_dim, latent_dim, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(_group_count(latent_dim), latent_dim),
+            nn.SiLU(),
+            nn.Conv2d(latent_dim, 1, kernel_size=1),
+        )
         self.up3 = _UpBlock(c4, c4, c3)
         self.up2 = _UpBlock(c3, c3, c2)
         self.up1 = _UpBlock(c2, c2, c1)
         self.head = nn.Conv2d(c1, 2, kernel_size=1)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         s1 = self.in_block(x)
         s2 = self.down1(s1)
         s3 = self.down2(s2)
         s4 = self.down3(s3)
         b = self.bottleneck(s4)
-        x = self.up3(b, s4)
+        latent = self.to_latent(b)
+        alpha_logits = self.alpha_head(latent)
+        x = self.from_latent(latent)
+        x = self.up3(x, s4)
         x = self.up2(x, s3)
         x = self.up1(x, s2)
         x = F.interpolate(x, size=s1.shape[-2:], mode="bilinear", align_corners=False)
         x = x + s1
         heads = self.head(x)
-        return heads[:, 0:1], heads[:, 1:2]
+        alpha_logits = F.interpolate(alpha_logits, size=s1.shape[-2:], mode="bilinear", align_corners=False)
+        return heads[:, 0:1], heads[:, 1:2], alpha_logits, latent
 
 
 class FullAircraftLatentMixer(nn.Module):

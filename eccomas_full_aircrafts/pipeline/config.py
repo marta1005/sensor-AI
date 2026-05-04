@@ -101,6 +101,7 @@ class FullAircraftConfig:
     shock_local_mixed_loss_weight: float = 1.0
     shock_local_smooth_head_weight: float = 0.35
     shock_local_shock_head_weight: float = 0.65
+    shock_local_alpha_loss_weight: float = 0.30
     shock_local_grad_loss_weight: float = 0.20
     shock_symbolic_max_samples: int = 250_000
     shock_symbolic_ridge_alpha: float = 1e-2

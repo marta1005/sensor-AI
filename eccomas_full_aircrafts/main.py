@@ -23,33 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         choices=["upper", "lower"],
         default="upper",
-        help="Active reduced surface for the train/latent/sensor/inference pipeline.",
-    )
-    common.add_argument(
-        "--expert-partition",
-        type=str,
-        choices=["mach", "cluster", "hybrid"],
-        default="hybrid",
-        help="How experts are partitioned: legacy Mach bands, learned clusters, or a merged physical hybrid partition.",
-    )
-    common.add_argument(
-        "--cluster-algorithm",
-        type=str,
-        choices=["kmeans", "gmm"],
-        default="kmeans",
-        help="Cluster model used when --expert-partition=cluster.",
-    )
-    common.add_argument(
-        "--cluster-count",
-        type=int,
-        default=3,
-        help="Number of clusters used when --expert-partition=cluster. Should match n_experts.",
-    )
-    common.add_argument(
-        "--hybrid-source-clusters",
-        type=int,
-        default=5,
-        help="Number of source KMeans clusters used before merging into the 3 hybrid experts.",
+        help="Active reduced surface for the current shock-local symbolic pipeline.",
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -83,21 +57,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser(
-        "train-experts",
-        parents=[common],
-        help="Train reduced full-aircraft experts over Mach bands, learned clusters, or the merged hybrid partition",
-    )
-
-    subparsers.add_parser(
         "train-shock-experts",
         parents=[common],
-        help="Train a shared global U-Net with smooth/shock expert heads over the reduced full-aircraft field",
+        help="Train a shared global U-Net with a latent bottleneck and smooth/shock local expert heads",
     )
 
     subparsers.add_parser(
         "distill-shock-sensor",
         parents=[common],
-        help="Fit a symbolic local shock sensor directly from gradient-derived shock targets",
+        help="Distill the latent local shock teacher into a symbolic local shock sensor",
     )
 
     shock_infer_parser = subparsers.add_parser(
@@ -108,56 +76,6 @@ def build_parser() -> argparse.ArgumentParser:
     shock_infer_parser.add_argument("--input-path", type=str, default=None)
     shock_infer_parser.add_argument("--output-path", type=str, default=None)
     shock_infer_parser.add_argument("--max-rows", type=int, default=None)
-
-    diagnose_experts_parser = subparsers.add_parser(
-        "diagnose-experts",
-        parents=[common],
-        help="Evaluate whether each expert is strongest on its own partition and summarize partition quality",
-    )
-    diagnose_experts_parser.add_argument("--splits", type=str, nargs="+", choices=["train", "test"], default=["train", "test"])
-
-    subparsers.add_parser(
-        "train-latent",
-        parents=[common],
-        help="Train the latent gate/MoE teacher over the reduced full-aircraft features",
-    )
-
-    subparsers.add_parser(
-        "distill-sensor",
-        parents=[common],
-        help="Distill the latent gate into a symbolic full-aircraft sensor for the active expert partition",
-    )
-
-    diffusion_train_parser = subparsers.add_parser(
-        "train-diffusion",
-        parents=[common],
-        help="Train a residual diffusion refiner on top of symbolic or neural baseline Cp predictions",
-    )
-    diffusion_train_parser.add_argument("--baseline-mode", type=str, choices=["symbolic", "neural"], default="symbolic")
-    diffusion_train_parser.add_argument("--train-prediction-path", type=str, default=None)
-    diffusion_train_parser.add_argument("--test-prediction-path", type=str, default=None)
-
-    diffusion_infer_parser = subparsers.add_parser(
-        "infer-diffusion",
-        parents=[common],
-        help="Refine an existing symbolic/neural baseline with the trained residual diffusion model",
-    )
-    diffusion_infer_parser.add_argument("--split", type=str, choices=["train", "test"], default="test")
-    diffusion_infer_parser.add_argument("--baseline-mode", type=str, choices=["symbolic", "neural"], default="symbolic")
-    diffusion_infer_parser.add_argument("--baseline-prediction-path", type=str, default=None)
-    diffusion_infer_parser.add_argument("--output-path", type=str, default=None)
-    diffusion_infer_parser.add_argument("--sample-steps", type=int, default=None)
-
-    infer_parser = subparsers.add_parser(
-        "infer",
-        parents=[common],
-        help="Run neural or symbolic inference over a reduced raw array",
-    )
-    infer_parser.add_argument("--input-path", type=str, default=None, help="Path to the raw/reduced input array. Defaults to reduced test data.")
-    infer_parser.add_argument("--mode", type=str, choices=["neural", "symbolic"], default="symbolic")
-    infer_parser.add_argument("--output-path", type=str, default=None)
-    infer_parser.add_argument("--batch-size", type=int, default=None)
-    infer_parser.add_argument("--max-rows", type=int, default=None)
 
     field_parser = subparsers.add_parser(
         "plot-raw-fields",
@@ -182,7 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
     infer_plot_parser = subparsers.add_parser(
         "plot-inference-cp",
         parents=[common],
-        help="Plot full-aircraft truth/symbolic/error Cp in the eval top/bottom style",
+        help="Plot full-aircraft truth/predicted/error Cp from the shock-symbolic pipeline",
     )
     infer_plot_parser.add_argument("--split", type=str, choices=["train", "test"], default="test")
     infer_plot_parser.add_argument("--condition-indices", type=int, nargs="*", default=None)
@@ -206,7 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
     infer_grid_parser = subparsers.add_parser(
         "plot-inference-cp-grid",
         parents=[common],
-        help="Plot several full-aircraft conditions in one truth/predicted/error grid",
+        help="Plot several full-aircraft conditions from the shock-symbolic pipeline in one grid",
     )
     infer_grid_parser.add_argument("--split", type=str, choices=["train", "test"], default="test")
     infer_grid_parser.add_argument("--condition-indices", type=int, nargs="+", required=True)
@@ -229,10 +147,6 @@ def _build_cfg(args: argparse.Namespace, surface: str | None = None) -> FullAirc
         raw_data_dir=Path(args.raw_data_dir) if getattr(args, "raw_data_dir", None) else None,
         pipeline_root=Path(args.pipeline_root) if getattr(args, "pipeline_root", None) else None,
         reduced_surface=surface or getattr(args, "reduced_surface", "upper"),
-        expert_partition_mode=getattr(args, "expert_partition", "hybrid"),
-        cluster_algorithm=getattr(args, "cluster_algorithm", "kmeans"),
-        cluster_count=int(getattr(args, "cluster_count", 3)),
-        hybrid_source_clusters=int(getattr(args, "hybrid_source_clusters", 5)),
     )
 
 
@@ -275,10 +189,6 @@ def main() -> None:
         from eccomas_full_aircrafts.pipeline.feature_store import prepare_feature_store
 
         prepare_feature_store(cfg)
-    elif args.command == "train-experts":
-        from eccomas_full_aircrafts.pipeline.train_experts import train_all_experts
-
-        train_all_experts(cfg)
     elif args.command == "train-shock-experts":
         from eccomas_full_aircrafts.pipeline.shock_local_pipeline import train_shock_experts
 
@@ -296,57 +206,6 @@ def main() -> None:
             cfg,
             input_path=input_path,
             output_path=output_path,
-            max_rows=args.max_rows,
-        )
-    elif args.command == "diagnose-experts":
-        from eccomas_full_aircrafts.pipeline.expert_diagnostics import diagnose_experts
-
-        diagnose_experts(cfg, splits=tuple(args.splits))
-    elif args.command == "train-latent":
-        from eccomas_full_aircrafts.pipeline.train_latent import train_latent_pipeline
-
-        train_latent_pipeline(cfg)
-    elif args.command == "distill-sensor":
-        from eccomas_full_aircrafts.pipeline.sensor_distillation import distill_sensor
-
-        distill_sensor(cfg)
-    elif args.command == "train-diffusion":
-        from eccomas_full_aircrafts.pipeline.diffusion_residual import train_diffusion_residual
-
-        train_prediction_path = Path(args.train_prediction_path).expanduser().resolve() if args.train_prediction_path else None
-        test_prediction_path = Path(args.test_prediction_path).expanduser().resolve() if args.test_prediction_path else None
-        train_diffusion_residual(
-            cfg,
-            baseline_mode=args.baseline_mode,
-            train_prediction_path=train_prediction_path,
-            test_prediction_path=test_prediction_path,
-        )
-    elif args.command == "infer-diffusion":
-        from eccomas_full_aircrafts.pipeline.diffusion_residual import infer_diffusion_residual
-
-        baseline_prediction_path = (
-            Path(args.baseline_prediction_path).expanduser().resolve() if args.baseline_prediction_path else None
-        )
-        output_path = Path(args.output_path).expanduser().resolve() if args.output_path else None
-        infer_diffusion_residual(
-            cfg,
-            split=args.split,
-            baseline_mode=args.baseline_mode,
-            baseline_prediction_path=baseline_prediction_path,
-            output_path=output_path,
-            sample_steps=args.sample_steps,
-        )
-    elif args.command == "infer":
-        from eccomas_full_aircrafts.pipeline.inference import run_inference
-
-        input_path = Path(args.input_path).expanduser().resolve() if args.input_path else (cfg.reduced_data_dir / "X_cut_test.npy")
-        output_path = Path(args.output_path).expanduser().resolve() if args.output_path else None
-        run_inference(
-            cfg,
-            input_path=input_path,
-            mode=args.mode,
-            output_path=output_path,
-            batch_size=args.batch_size,
             max_rows=args.max_rows,
         )
     elif args.command == "plot-raw-fields":

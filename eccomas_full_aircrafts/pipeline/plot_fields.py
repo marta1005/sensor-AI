@@ -357,10 +357,10 @@ def generate_inference_cp_grid_plot(
         raise FileNotFoundError(f"Reduced arrays not found for split={split} in {cfg.reduced_data_dir}")
 
     if prediction_path is None:
-        prediction_path = cfg.inference_dir / f"{x_path.stem}_symbolic.npz"
+        prediction_path = cfg.inference_dir / f"{x_path.stem}_shock_symbolic.npz"
     prediction_path = Path(prediction_path).expanduser().resolve()
     if not prediction_path.exists():
-        raise FileNotFoundError(f"Prediction file not found: {prediction_path}. Run 'infer --mode symbolic' first.")
+        raise FileNotFoundError(f"Prediction file not found: {prediction_path}. Run 'infer-shock-symbolic' first.")
 
     x_red = np.load(x_path, mmap_mode="r")
     y_red = np.load(y_path, mmap_mode="r")
@@ -515,7 +515,7 @@ def generate_inference_cp_grid_plot(
         )
 
     fig.suptitle(
-        f"Full-aircraft {cfg.reduced_surface} symbolic inference | multiple test conditions",
+        f"Full-aircraft {cfg.reduced_surface} shock-symbolic inference | multiple test conditions",
         fontsize=13,
         y=0.99,
     )
@@ -620,10 +620,10 @@ def generate_inference_cp_plots(
         raise FileNotFoundError(f"Reduced arrays not found for split={split} in {cfg.reduced_data_dir}")
 
     if prediction_path is None:
-        prediction_path = cfg.inference_dir / f"{x_path.stem}_symbolic.npz"
+        prediction_path = cfg.inference_dir / f"{x_path.stem}_shock_symbolic.npz"
     prediction_path = Path(prediction_path).expanduser().resolve()
     if not prediction_path.exists():
-        raise FileNotFoundError(f"Prediction file not found: {prediction_path}. Run 'infer --mode symbolic' first.")
+        raise FileNotFoundError(f"Prediction file not found: {prediction_path}. Run 'infer-shock-symbolic' first.")
     include_error = layout == "truth-pred-error"
 
     x_red = np.load(x_path, mmap_mode="r")
@@ -661,7 +661,7 @@ def generate_inference_cp_plots(
             cp_true_plot,
             cp_pred_plot,
             rec,
-            title_prefix=f"Full-aircraft {cfg.reduced_surface} symbolic inference",
+            title_prefix=f"Full-aircraft {cfg.reduced_surface} shock-symbolic inference",
             out_path=out_path,
             include_error=include_error,
             view=view,

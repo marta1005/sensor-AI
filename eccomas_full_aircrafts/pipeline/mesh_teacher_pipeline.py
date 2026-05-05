@@ -120,31 +120,48 @@ def _gradient_loss(pred_grid: torch.Tensor, target_grid: torch.Tensor, weight_ma
     return 0.5 * ((loss_dx.flatten(1).sum(dim=1) / denom_dx).mean() + (loss_dy.flatten(1).sum(dim=1) / denom_dy).mean())
 
 
-def _shock_target_map_numpy(cp_grid: np.ndarray, mask: np.ndarray, quantile: float) -> np.ndarray:
-    grad_y, grad_x = np.gradient(cp_grid.astype(np.float32), edge_order=1)
+def _normalized_gradient_map(field_grid: np.ndarray, mask: np.ndarray, quantile: float) -> np.ndarray:
+    grad_y, grad_x = np.gradient(field_grid.astype(np.float32), edge_order=1)
     grad_mag = np.sqrt(grad_x * grad_x + grad_y * grad_y) * mask
     valid = grad_mag[mask > 0.5]
     if valid.size == 0:
-        return np.zeros_like(cp_grid, dtype=np.float32)
+        return np.zeros_like(field_grid, dtype=np.float32)
     scale = float(np.quantile(valid, quantile))
     if scale <= 1e-6:
-        return np.zeros_like(cp_grid, dtype=np.float32)
+        return np.zeros_like(field_grid, dtype=np.float32)
     return np.clip(grad_mag / scale, 0.0, 1.0).astype(np.float32) * mask
+
+
+def _shock_target_map_numpy(cp_grid: np.ndarray, cfx_grid: np.ndarray, mask: np.ndarray, quantile: float, cfx_weight: float) -> np.ndarray:
+    cp_map = _normalized_gradient_map(cp_grid, mask, quantile)
+    cfx_map = _normalized_gradient_map(cfx_grid, mask, quantile)
+    return np.clip(cp_map + float(cfx_weight) * cfx_map, 0.0, 1.0).astype(np.float32) * mask
 
 
 def _build_shock_target_array(cfg: FullAircraftConfig, split: str, graph: CompactSurfaceGraph) -> np.ndarray:
     target_path = cfg.features_dir / f"mesh_shock_target_{split}.npy"
+    y_red = np.load(cfg.reduced_data_dir / f"Y_cut_{split}.npy", mmap_mode="r")
+    expected_rows = int(y_red.shape[0])
     if target_path.exists():
-        return np.load(target_path, mmap_mode="r")
+        cached = np.load(target_path, mmap_mode="r")
+        if int(cached.shape[0]) == expected_rows:
+            return cached
+        target_path.unlink()
 
-    cp = np.load(cfg.features_dir / f"cp_{split}.npy", mmap_mode="r")
-    n_conditions = int(cp.shape[0] // graph.n_points)
-    alpha = np.zeros((cp.shape[0], 1), dtype=np.float32)
+    n_conditions = int(y_red.shape[0] // graph.n_points)
+    alpha = np.zeros((y_red.shape[0], 1), dtype=np.float32)
     for cond_idx in range(n_conditions):
         row_start = cond_idx * graph.n_points
         row_stop = row_start + graph.n_points
-        cp_grid = graph.scatter_numpy(np.asarray(cp[row_start:row_stop], dtype=np.float32))[0]
-        alpha_grid = _shock_target_map_numpy(cp_grid, graph.valid_mask, cfg.mesh_teacher_shock_quantile)
+        cp_grid = graph.scatter_numpy(np.asarray(y_red[row_start:row_stop, [cfg.cp_column]], dtype=np.float32))[0]
+        cfx_grid = graph.scatter_numpy(np.asarray(y_red[row_start:row_stop, [cfg.cfx_column]], dtype=np.float32))[0]
+        alpha_grid = _shock_target_map_numpy(
+            cp_grid,
+            cfx_grid,
+            graph.valid_mask,
+            cfg.mesh_teacher_shock_quantile,
+            cfg.mesh_teacher_cfx_weight,
+        )
         alpha[row_start:row_stop, 0] = graph.gather_numpy(alpha_grid[None, ...])[:, 0]
         if cond_idx == 0 or cond_idx + 1 == n_conditions or cond_idx % 25 == 0:
             print(f"[mesh-shock-target] {split}: condition {cond_idx + 1}/{n_conditions}")
@@ -189,6 +206,7 @@ def _save_model_config(cfg: FullAircraftConfig, graph: CompactSurfaceGraph, inpu
         "height": int(graph.height),
         "width": int(graph.width),
         "shock_quantile": float(cfg.mesh_teacher_shock_quantile),
+        "cfx_weight": float(cfg.mesh_teacher_cfx_weight),
     }
     with _model_config_path(cfg).open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
@@ -462,6 +480,8 @@ def train_mesh_teacher(cfg: FullAircraftConfig) -> None:
             "hidden_dim": int(cfg.mesh_teacher_hidden_dim),
             "latent_dim": int(cfg.latent_dim),
             "message_passing_steps": int(cfg.mesh_teacher_message_passing_steps),
+            "shock_quantile": float(cfg.mesh_teacher_shock_quantile),
+            "cfx_weight": float(cfg.mesh_teacher_cfx_weight),
         },
     )
     save_json(_diagnostics_path(cfg, "train"), {"split": "train", **{k: float(v) for k, v in train_diag.items()}})

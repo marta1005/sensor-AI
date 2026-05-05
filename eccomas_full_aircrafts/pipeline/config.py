@@ -35,6 +35,7 @@ class FullAircraftConfig:
     latent_dim: int = 4
     n_experts: int = 3
     cp_column: int = 0
+    cfx_column: int = 1
     expert_partition_mode: str = "hybrid"
     cluster_algorithm: str = "kmeans"
     cluster_count: int = 3
@@ -119,6 +120,7 @@ class FullAircraftConfig:
     mesh_teacher_shock_head_weight: float = 0.65
     mesh_teacher_alpha_loss_weight: float = 0.30
     mesh_teacher_grad_loss_weight: float = 0.20
+    mesh_teacher_cfx_weight: float = 0.30
     mesh_symbolic_max_samples: int = 250_000
     mesh_symbolic_ridge_alpha: float = 1e-2
 

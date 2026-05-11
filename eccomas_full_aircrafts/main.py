@@ -77,7 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "distill-mesh-sensor",
         parents=[common],
-        help="Distill the MeshGraphNet teacher alpha into a symbolic local shock sensor",
+        help="Distill the MeshGraphNet teacher alpha into a symbolic shock-line sensor",
     )
 
     shock_infer_parser = subparsers.add_parser(
@@ -92,11 +92,20 @@ def build_parser() -> argparse.ArgumentParser:
     mesh_infer_parser = subparsers.add_parser(
         "infer-mesh-symbolic",
         parents=[common],
-        help="Infer Cp with the MeshGraphNet teacher heads mixed by the symbolic local sensor",
+        help="Infer Cp with the MeshGraphNet teacher heads mixed by the symbolic shock-line sensor",
     )
     mesh_infer_parser.add_argument("--input-path", type=str, default=None)
     mesh_infer_parser.add_argument("--output-path", type=str, default=None)
     mesh_infer_parser.add_argument("--max-rows", type=int, default=None)
+
+    mesh_teacher_infer_parser = subparsers.add_parser(
+        "infer-mesh-teacher",
+        parents=[common],
+        help="Infer Cp with the MeshGraphNet teacher using the teacher alpha directly",
+    )
+    mesh_teacher_infer_parser.add_argument("--input-path", type=str, default=None)
+    mesh_teacher_infer_parser.add_argument("--output-path", type=str, default=None)
+    mesh_teacher_infer_parser.add_argument("--max-rows", type=int, default=None)
 
     field_parser = subparsers.add_parser(
         "plot-raw-fields",
@@ -243,6 +252,17 @@ def main() -> None:
         input_path = Path(args.input_path).expanduser().resolve() if args.input_path else None
         output_path = Path(args.output_path).expanduser().resolve() if args.output_path else None
         infer_mesh_symbolic(
+            cfg,
+            input_path=input_path,
+            output_path=output_path,
+            max_rows=args.max_rows,
+        )
+    elif args.command == "infer-mesh-teacher":
+        from eccomas_full_aircrafts.pipeline.mesh_teacher_pipeline import infer_mesh_teacher
+
+        input_path = Path(args.input_path).expanduser().resolve() if args.input_path else None
+        output_path = Path(args.output_path).expanduser().resolve() if args.output_path else None
+        infer_mesh_teacher(
             cfg,
             input_path=input_path,
             output_path=output_path,

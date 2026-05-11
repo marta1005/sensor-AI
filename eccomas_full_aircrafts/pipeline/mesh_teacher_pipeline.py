@@ -16,7 +16,7 @@ from .config import FullAircraftConfig
 from .features import SYMBOLIC_GATE_ENCODER_FEATURE_NAMES, SYMBOLIC_GATE_ENCODER_INDICES, build_encoder_features, build_expert_features
 from .models import FullAircraftMeshTeacher
 from .surface_graph import CompactSurfaceGraph
-from .utils import sample_indices, save_json
+from .utils import save_json
 
 _PLOT_CACHE = Path(__file__).resolve().parents[1] / ".plot_cache"
 _PLOT_CACHE.mkdir(parents=True, exist_ok=True)
@@ -36,6 +36,20 @@ MESH_SENSOR_EXTRA_FEATURE_NAMES = [
     "Mach_AoA",
 ]
 MESH_SENSOR_FEATURE_NAMES = SYMBOLIC_GATE_ENCODER_FEATURE_NAMES + MESH_SENSOR_EXTRA_FEATURE_NAMES
+MESH_SHOCK_LINE_FEATURE_NAMES = [
+    "row_y",
+    "row_z",
+    "Mach",
+    "Pi",
+    "AoA_deg",
+    "row_y_sq",
+    "row_z_sq",
+    "Mach_sq",
+    "AoA_sq",
+    "Mach_AoA",
+    "Mach_row_y",
+    "AoA_row_y",
+]
 
 
 def _model_path(cfg: FullAircraftConfig) -> Path:
@@ -68,6 +82,10 @@ def _teacher_alpha_path(cfg: FullAircraftConfig, split: str) -> Path:
 
 def _default_inference_output_path(cfg: FullAircraftConfig, input_path: Path) -> Path:
     return cfg.inference_dir / f"{input_path.stem}_mesh_symbolic.npz"
+
+
+def _default_teacher_inference_output_path(cfg: FullAircraftConfig, input_path: Path) -> Path:
+    return cfg.inference_dir / f"{input_path.stem}_mesh_teacher.npz"
 
 
 def _load_cp_scaler(cfg: FullAircraftConfig) -> tuple[np.ndarray, np.ndarray]:
@@ -225,7 +243,7 @@ def _build_sensor_basis(x_raw: np.ndarray) -> np.ndarray:
     return np.concatenate([base, extra], axis=1).astype(np.float64)
 
 
-def _render_linear_equation(intercept: float, coefficients: np.ndarray, basis_names: list[str], top_k: int = 10) -> str:
+def _render_linear_expression(intercept: float, coefficients: np.ndarray, basis_names: list[str], top_k: int = 10) -> str:
     coef = np.asarray(coefficients, dtype=np.float64)
     order = np.argsort(-np.abs(coef))
     parts = [f"{intercept:.4f}"]
@@ -238,7 +256,11 @@ def _render_linear_equation(intercept: float, coefficients: np.ndarray, basis_na
         used += 1
         if used >= top_k:
             break
-    return "clip(" + "".join(parts) + ", 0, 1)"
+    return "".join(parts)
+
+
+def _render_linear_equation(intercept: float, coefficients: np.ndarray, basis_names: list[str], top_k: int = 10) -> str:
+    return "clip(" + _render_linear_expression(intercept, coefficients, basis_names, top_k=top_k) + ", 0, 1)"
 
 
 def _solve_linear_sensor(basis_train: np.ndarray, target_train: np.ndarray, cfg: FullAircraftConfig) -> dict[str, object]:
@@ -272,6 +294,254 @@ def _apply_linear_sensor_basis(basis: np.ndarray, artifact: dict[str, object], c
     standardized = np.clip((basis - mean) / scale, -cfg.sensor_feature_clip, cfg.sensor_feature_clip)
     design = np.concatenate([np.ones((standardized.shape[0], 1), dtype=np.float64), standardized], axis=1)
     return np.clip(design @ coef_std, 0.0, 1.0).astype(np.float32)
+
+
+def _row_geometry(graph: CompactSurfaceGraph) -> dict[str, np.ndarray]:
+    height = int(graph.height)
+    row_y = np.zeros(height, dtype=np.float32)
+    row_z = np.zeros(height, dtype=np.float32)
+    row_x_min = np.zeros(height, dtype=np.float32)
+    row_x_max = np.zeros(height, dtype=np.float32)
+    row_valid = np.zeros(height, dtype=bool)
+    for row in range(height):
+        idx = graph.row_idx == row
+        if not np.any(idx):
+            continue
+        row_valid[row] = True
+        row_xyz = graph.coords[idx]
+        row_y[row] = float(np.mean(row_xyz[:, 1]))
+        row_z[row] = float(np.mean(row_xyz[:, 2]))
+        row_x_min[row] = float(np.min(row_xyz[:, 0]))
+        row_x_max[row] = float(np.max(row_xyz[:, 0]))
+    row_x_mid = 0.5 * (row_x_min + row_x_max)
+    row_x_span = np.maximum(row_x_max - row_x_min, 1e-3)
+    return {
+        "row_y": row_y,
+        "row_z": row_z,
+        "row_x_min": row_x_min,
+        "row_x_max": row_x_max,
+        "row_x_mid": row_x_mid.astype(np.float32),
+        "row_x_span": row_x_span.astype(np.float32),
+        "row_valid": row_valid,
+    }
+
+
+def _build_shock_line_basis(condition_raw: np.ndarray, graph: CompactSurfaceGraph) -> np.ndarray:
+    if condition_raw.ndim != 2 or condition_raw.shape[1] < 9:
+        raise ValueError(f"Expected [n_conditions, >=9] raw condition array, got {condition_raw.shape}")
+    geometry = _row_geometry(graph)
+    row_y = geometry["row_y"].astype(np.float64)
+    row_z = geometry["row_z"].astype(np.float64)
+    n_conditions = int(condition_raw.shape[0])
+    n_rows = int(graph.height)
+
+    mach = np.repeat(condition_raw[:, 6:7].astype(np.float64), n_rows, axis=0)
+    pi = np.repeat(condition_raw[:, 8:9].astype(np.float64), n_rows, axis=0)
+    aoa = np.repeat(condition_raw[:, 7:8].astype(np.float64), n_rows, axis=0)
+    row_y_rep = np.tile(row_y, n_conditions)[:, None]
+    row_z_rep = np.tile(row_z, n_conditions)[:, None]
+
+    basis = np.concatenate(
+        [
+            row_y_rep,
+            row_z_rep,
+            mach,
+            pi,
+            aoa,
+            row_y_rep * row_y_rep,
+            row_z_rep * row_z_rep,
+            mach * mach,
+            aoa * aoa,
+            mach * aoa,
+            mach * row_y_rep,
+            aoa * row_y_rep,
+        ],
+        axis=1,
+    )
+    return basis.astype(np.float64)
+
+
+def _solve_weighted_linear_model(
+    basis_train: np.ndarray,
+    target_train: np.ndarray,
+    feature_names: list[str],
+    ridge_alpha: float,
+    clip_value: float,
+    weights: np.ndarray | None = None,
+    output_kind: str = "identity",
+    clip_min: float | None = None,
+    clip_max: float | None = None,
+    top_k: int = 12,
+) -> dict[str, object]:
+    mean = basis_train.mean(axis=0)
+    scale = basis_train.std(axis=0) + 1e-6
+    standardized = np.clip((basis_train - mean) / scale, -clip_value, clip_value)
+    design = np.concatenate([np.ones((standardized.shape[0], 1), dtype=np.float64), standardized], axis=1)
+    weight_vec = np.ones((design.shape[0],), dtype=np.float64) if weights is None else np.clip(np.asarray(weights, dtype=np.float64), 0.0, None)
+    sqrt_w = np.sqrt(weight_vec)[:, None]
+    design_w = design * sqrt_w
+    target_w = target_train.astype(np.float64) * sqrt_w[:, 0]
+    gram = design_w.T @ design_w
+    ridge = np.eye(gram.shape[0], dtype=np.float64)
+    ridge[0, 0] = 0.0
+    system = gram + float(ridge_alpha) * ridge
+    rhs = design_w.T @ target_w
+    coef_std = np.linalg.solve(system, rhs)
+    coef_raw = coef_std[1:] / scale
+    intercept_raw = float(coef_std[0] - np.sum(coef_std[1:] * mean / scale))
+    expression = _render_linear_expression(intercept_raw, coef_raw, feature_names, top_k=top_k)
+    if output_kind == "clip01":
+        equation = f"clip({expression}, 0, 1)"
+    elif output_kind == "exp_clip":
+        floor = float(clip_min if clip_min is not None else 0.0)
+        ceiling = float(clip_max if clip_max is not None else np.inf)
+        equation = f"clip(exp({expression}), {floor:.4f}, {ceiling:.4f})"
+    else:
+        equation = expression
+    return {
+        "feature_mean": mean.tolist(),
+        "feature_scale": scale.tolist(),
+        "coefficients_std": coef_std.tolist(),
+        "coefficients_raw": coef_raw.tolist(),
+        "intercept_raw": intercept_raw,
+        "equation": equation,
+        "output_kind": output_kind,
+        "clip_min": None if clip_min is None else float(clip_min),
+        "clip_max": None if clip_max is None else float(clip_max),
+    }
+
+
+def _apply_weighted_linear_model(basis: np.ndarray, artifact: dict[str, object], clip_value: float) -> np.ndarray:
+    mean = np.asarray(artifact["feature_mean"], dtype=np.float64)
+    scale = np.asarray(artifact["feature_scale"], dtype=np.float64)
+    coef_std = np.asarray(artifact["coefficients_std"], dtype=np.float64)
+    standardized = np.clip((basis - mean) / scale, -clip_value, clip_value)
+    design = np.concatenate([np.ones((standardized.shape[0], 1), dtype=np.float64), standardized], axis=1)
+    raw = design @ coef_std
+    output_kind = str(artifact.get("output_kind", "identity"))
+    if output_kind == "clip01":
+        return np.clip(raw, 0.0, 1.0).astype(np.float32)
+    if output_kind == "exp_clip":
+        floor = float(artifact.get("clip_min", 0.0))
+        ceiling = float(artifact.get("clip_max", np.inf))
+        return np.clip(np.exp(raw), floor, ceiling).astype(np.float32)
+    return raw.astype(np.float32)
+
+
+def _derive_shock_line_targets(alpha_flat: np.ndarray, graph: CompactSurfaceGraph, cfg: FullAircraftConfig) -> dict[str, np.ndarray]:
+    n_conditions = int(alpha_flat.shape[0] // graph.n_points)
+    geometry = _row_geometry(graph)
+    row_valid = geometry["row_valid"]
+    row_x_mid = geometry["row_x_mid"]
+    x_grid = graph.scatter_numpy(graph.coords[:, [0]])[0]
+    n_rows = int(graph.height)
+    presence = np.zeros((n_conditions, n_rows), dtype=np.float32)
+    center = np.tile(row_x_mid[None, :], (n_conditions, 1)).astype(np.float32)
+    width = np.full((n_conditions, n_rows), float(cfg.mesh_shock_line_width_floor), dtype=np.float32)
+
+    for cond_idx in range(n_conditions):
+        row_start = cond_idx * graph.n_points
+        row_stop = row_start + graph.n_points
+        alpha_values = np.asarray(alpha_flat[row_start:row_stop], dtype=np.float32).reshape(graph.n_points, 1)
+        alpha_grid = graph.scatter_numpy(alpha_values)[0]
+        for row in range(n_rows):
+            if not row_valid[row]:
+                continue
+            valid = graph.valid_mask[row] > 0.5
+            row_alpha = alpha_grid[row, valid]
+            row_x = x_grid[row, valid]
+            if row_alpha.size == 0:
+                continue
+            peak = float(np.max(row_alpha))
+            presence[cond_idx, row] = peak
+            weights = np.maximum(row_alpha - float(cfg.mesh_shock_line_activation_threshold), 0.0) ** float(cfg.mesh_shock_line_weight_power)
+            if float(np.sum(weights)) <= 1e-8:
+                weights = np.maximum(row_alpha, 0.0) ** float(cfg.mesh_shock_line_weight_power)
+            if float(np.sum(weights)) <= 1e-8:
+                continue
+            center_val = float(np.sum(weights * row_x) / np.sum(weights))
+            variance = float(np.sum(weights * (row_x - center_val) ** 2) / np.sum(weights))
+            width_val = float(np.clip(2.0 * np.sqrt(max(variance, 1e-8)), cfg.mesh_shock_line_width_floor, cfg.mesh_shock_line_width_ceiling))
+            center[cond_idx, row] = center_val
+            width[cond_idx, row] = width_val
+    return {
+        "presence": presence,
+        "center": center,
+        "width": width,
+    }
+
+
+def _predict_shock_line_rows(
+    cfg: FullAircraftConfig,
+    condition_raw: np.ndarray,
+    graph: CompactSurfaceGraph,
+    artifact: dict[str, object],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    geometry = _row_geometry(graph)
+    basis = _build_shock_line_basis(condition_raw[None, : cfg.input_dim_raw].astype(np.float32), graph)
+    presence = _apply_weighted_linear_model(basis, artifact["presence_model"], cfg.sensor_feature_clip)
+    center = _apply_weighted_linear_model(basis, artifact["center_model"], cfg.sensor_feature_clip)
+    width = _apply_weighted_linear_model(basis, artifact["width_model"], cfg.sensor_feature_clip)
+    presence = np.clip(presence.reshape(-1), 0.0, 1.0)
+    center = np.clip(center.reshape(-1), geometry["row_x_min"], geometry["row_x_max"])
+    width = np.clip(width.reshape(-1), cfg.mesh_shock_line_width_floor, cfg.mesh_shock_line_width_ceiling)
+    return presence.astype(np.float32), center.astype(np.float32), width.astype(np.float32)
+
+
+def _apply_shock_line_sensor_condition(
+    cfg: FullAircraftConfig,
+    x_chunk: np.ndarray,
+    graph: CompactSurfaceGraph,
+    artifact: dict[str, object],
+) -> np.ndarray:
+    presence, center, width = _predict_shock_line_rows(cfg, x_chunk[0], graph, artifact)
+    point_rows = graph.row_idx
+    point_x = x_chunk[:, 0].astype(np.float32)
+    row_presence = presence[point_rows]
+    row_center = center[point_rows]
+    row_width = width[point_rows]
+    alpha = row_presence * np.exp(-0.5 * ((point_x - row_center) / np.maximum(row_width, 1e-6)) ** 2)
+    return np.clip(alpha, 0.0, 1.0).astype(np.float32)
+
+
+def _evaluate_shock_line_sensor(
+    cfg: FullAircraftConfig,
+    x_raw: np.ndarray,
+    alpha_true: np.ndarray,
+    graph: CompactSurfaceGraph,
+    artifact: dict[str, object],
+) -> dict[str, float]:
+    n_conditions = int(x_raw.shape[0] // graph.n_points)
+    abs_err = 0.0
+    count = 0.0
+    tp = 0.0
+    fp = 0.0
+    fn = 0.0
+    threshold = float(cfg.mesh_teacher_binary_threshold)
+    for cond_idx in range(n_conditions):
+        row_start = cond_idx * graph.n_points
+        row_stop = row_start + graph.n_points
+        x_chunk = np.asarray(x_raw[row_start:row_stop, : cfg.input_dim_raw], dtype=np.float32)
+        pred = _apply_shock_line_sensor_condition(cfg, x_chunk, graph, artifact)
+        target = np.asarray(alpha_true[row_start:row_stop], dtype=np.float32).reshape(-1)
+        abs_err += float(np.abs(pred - target).sum())
+        count += float(target.shape[0])
+        target_bin = target >= threshold
+        pred_bin = pred >= threshold
+        tp += float(np.logical_and(target_bin, pred_bin).sum())
+        fp += float(np.logical_and(~target_bin, pred_bin).sum())
+        fn += float(np.logical_and(target_bin, ~pred_bin).sum())
+    precision = tp / max(1.0, tp + fp)
+    recall = tp / max(1.0, tp + fn)
+    iou = tp / max(1.0, tp + fp + fn)
+    f1 = 2.0 * precision * recall / max(1e-8, precision + recall)
+    return {
+        "mae": abs_err / max(1.0, count),
+        "precision": precision,
+        "recall": recall,
+        "iou": iou,
+        "f1": f1,
+    }
 
 
 def _binary_metrics(target: np.ndarray, pred: np.ndarray, threshold: float) -> dict[str, float]:
@@ -534,40 +804,97 @@ def distill_mesh_sensor(cfg: FullAircraftConfig) -> None:
     alpha_test = np.asarray(_build_teacher_alpha_array(cfg, "test", graph, model)[:, 0], dtype=np.float32)
     x_train = np.load(cfg.cut_data_dir / "X_cut_train.npy", mmap_mode="r")
     x_test = np.load(cfg.cut_data_dir / "X_cut_test.npy", mmap_mode="r")
+    train_cond = np.asarray(x_train[:: graph.n_points, : cfg.input_dim_raw], dtype=np.float32)
+    test_cond = np.asarray(x_test[:: graph.n_points, : cfg.input_dim_raw], dtype=np.float32)
+    row_basis_train = _build_shock_line_basis(train_cond, graph)
+    row_basis_test = _build_shock_line_basis(test_cond, graph)
+    train_targets = _derive_shock_line_targets(alpha_train, graph, cfg)
+    test_targets = _derive_shock_line_targets(alpha_test, graph, cfg)
 
-    train_idx = sample_indices(x_train.shape[0], min(cfg.mesh_symbolic_max_samples, int(x_train.shape[0])), seed=42)
-    test_idx = sample_indices(x_test.shape[0], min(cfg.mesh_symbolic_max_samples, int(x_test.shape[0])), seed=123)
-    basis_train = _build_sensor_basis(np.asarray(x_train[train_idx, : cfg.input_dim_raw], dtype=np.float32))
-    basis_test = _build_sensor_basis(np.asarray(x_test[test_idx, : cfg.input_dim_raw], dtype=np.float32))
+    presence_train = train_targets["presence"].reshape(-1)
+    center_train = train_targets["center"].reshape(-1)
+    width_train = train_targets["width"].reshape(-1)
+    presence_test = test_targets["presence"].reshape(-1)
+    center_test = test_targets["center"].reshape(-1)
+    width_test = test_targets["width"].reshape(-1)
+    active_train = presence_train >= float(cfg.mesh_shock_line_activation_threshold)
+    active_test = presence_test >= float(cfg.mesh_shock_line_activation_threshold)
 
     artifact = {
-        "type": "mesh_local_shock_linear_map",
-        "description": "Symbolic local shock sensor distilled from the MeshGraphNet teacher alpha.",
+        "type": "mesh_shock_line_symbolic",
+        "description": "Symbolic shock-line sensor distilled from the MeshGraphNet teacher alpha.",
         "surface": cfg.reduced_surface,
-        "feature_names": MESH_SENSOR_FEATURE_NAMES,
+        "feature_names": MESH_SHOCK_LINE_FEATURE_NAMES,
         "binary_threshold": float(cfg.mesh_teacher_binary_threshold),
         "ridge_alpha": float(cfg.mesh_symbolic_ridge_alpha),
         "feature_clip": float(cfg.sensor_feature_clip),
         "teacher_source": "mesh_teacher_alpha",
         "latent_dim": int(cfg.latent_dim),
-        **_solve_linear_sensor(basis_train, alpha_train[train_idx], cfg),
+        "activation_threshold": float(cfg.mesh_shock_line_activation_threshold),
+        "weight_power": float(cfg.mesh_shock_line_weight_power),
+        "width_floor": float(cfg.mesh_shock_line_width_floor),
+        "width_ceiling": float(cfg.mesh_shock_line_width_ceiling),
+        "alpha_formula": "alpha(x,y)=clip(presence(y)*exp(-0.5*((x-x_shock(y))/width(y))^2), 0, 1)",
+        "presence_model": _solve_weighted_linear_model(
+            row_basis_train,
+            presence_train,
+            MESH_SHOCK_LINE_FEATURE_NAMES,
+            cfg.mesh_symbolic_ridge_alpha,
+            cfg.sensor_feature_clip,
+            output_kind="clip01",
+        ),
+        "center_model": _solve_weighted_linear_model(
+            row_basis_train,
+            center_train,
+            MESH_SHOCK_LINE_FEATURE_NAMES,
+            cfg.mesh_symbolic_ridge_alpha,
+            cfg.sensor_feature_clip,
+            weights=np.maximum(presence_train, 1e-3),
+            output_kind="identity",
+        ),
+        "width_model": _solve_weighted_linear_model(
+            row_basis_train,
+            np.log(np.clip(width_train, cfg.mesh_shock_line_width_floor, None)),
+            MESH_SHOCK_LINE_FEATURE_NAMES,
+            cfg.mesh_symbolic_ridge_alpha,
+            cfg.sensor_feature_clip,
+            weights=np.maximum(presence_train, 1e-3),
+            output_kind="exp_clip",
+            clip_min=cfg.mesh_shock_line_width_floor,
+            clip_max=cfg.mesh_shock_line_width_ceiling,
+        ),
     }
-    pred_train = _apply_linear_sensor_basis(basis_train, artifact, cfg)
-    pred_test = _apply_linear_sensor_basis(basis_test, artifact, cfg)
-    train_mae = float(np.mean(np.abs(pred_train - alpha_train[train_idx])))
-    test_mae = float(np.mean(np.abs(pred_test - alpha_test[test_idx])))
-    artifact["train_mae"] = train_mae
-    artifact["test_mae"] = test_mae
-    artifact["train_binary_metrics"] = _binary_metrics(alpha_train[train_idx], pred_train, cfg.mesh_teacher_binary_threshold)
-    artifact["test_binary_metrics"] = _binary_metrics(alpha_test[test_idx], pred_test, cfg.mesh_teacher_binary_threshold)
+    train_eval = _evaluate_shock_line_sensor(cfg, x_train, alpha_train, graph, artifact)
+    test_eval = _evaluate_shock_line_sensor(cfg, x_test, alpha_test, graph, artifact)
+    pred_presence_train = _apply_weighted_linear_model(row_basis_train, artifact["presence_model"], cfg.sensor_feature_clip).reshape(-1)
+    pred_center_train = _apply_weighted_linear_model(row_basis_train, artifact["center_model"], cfg.sensor_feature_clip).reshape(-1)
+    pred_width_train = _apply_weighted_linear_model(row_basis_train, artifact["width_model"], cfg.sensor_feature_clip).reshape(-1)
+    pred_presence_test = _apply_weighted_linear_model(row_basis_test, artifact["presence_model"], cfg.sensor_feature_clip).reshape(-1)
+    pred_center_test = _apply_weighted_linear_model(row_basis_test, artifact["center_model"], cfg.sensor_feature_clip).reshape(-1)
+    pred_width_test = _apply_weighted_linear_model(row_basis_test, artifact["width_model"], cfg.sensor_feature_clip).reshape(-1)
+    artifact["train_mae"] = float(train_eval["mae"])
+    artifact["test_mae"] = float(test_eval["mae"])
+    artifact["train_binary_metrics"] = {k: float(v) for k, v in train_eval.items() if k != "mae"}
+    artifact["test_binary_metrics"] = {k: float(v) for k, v in test_eval.items() if k != "mae"}
+    artifact["row_metrics"] = {
+        "train_presence_mae": float(np.mean(np.abs(pred_presence_train - presence_train))),
+        "test_presence_mae": float(np.mean(np.abs(pred_presence_test - presence_test))),
+        "train_center_mae_active": float(np.mean(np.abs(pred_center_train[active_train] - center_train[active_train]))) if np.any(active_train) else 0.0,
+        "test_center_mae_active": float(np.mean(np.abs(pred_center_test[active_test] - center_test[active_test]))) if np.any(active_test) else 0.0,
+        "train_width_mae_active": float(np.mean(np.abs(pred_width_train[active_train] - width_train[active_train]))) if np.any(active_train) else 0.0,
+        "test_width_mae_active": float(np.mean(np.abs(pred_width_test[active_test] - width_test[active_test]))) if np.any(active_test) else 0.0,
+    }
 
     with _sensor_json_path(cfg).open("w", encoding="utf-8") as handle:
         json.dump(artifact, handle, indent=2)
     with _sensor_txt_path(cfg).open("w", encoding="utf-8") as handle:
-        handle.write(artifact["equation"] + "\n")
-        handle.write(json.dumps({"train_mae": train_mae, "test_mae": test_mae}, indent=2) + "\n")
+        handle.write("presence(y, z, Mach, Pi, AoA) = " + artifact["presence_model"]["equation"] + "\n")
+        handle.write("x_shock(y, z, Mach, Pi, AoA) = " + artifact["center_model"]["equation"] + "\n")
+        handle.write("width(y, z, Mach, Pi, AoA) = " + artifact["width_model"]["equation"] + "\n")
+        handle.write(artifact["alpha_formula"] + "\n")
+        handle.write(json.dumps({"train_mae": artifact["train_mae"], "test_mae": artifact["test_mae"]}, indent=2) + "\n")
     print(
-        f"[distill-mesh-sensor] train_mae={train_mae:.5f}, test_mae={test_mae:.5f}, "
+        f"[distill-mesh-sensor] train_mae={artifact['train_mae']:.5f}, test_mae={artifact['test_mae']:.5f}, "
         f"test_iou={artifact['test_binary_metrics']['iou']:.3f}"
     )
     print(f"[distill-mesh-sensor] Sensor stored in {_sensor_json_path(cfg)}")
@@ -579,8 +906,76 @@ def _load_mesh_sensor(cfg: FullAircraftConfig) -> dict[str, object]:
 
 
 def apply_symbolic_mesh_sensor(cfg: FullAircraftConfig, x_raw: np.ndarray, artifact: dict[str, object]) -> np.ndarray:
+    sensor_type = str(artifact.get("type", "mesh_local_shock_linear_map"))
+    if sensor_type == "mesh_shock_line_symbolic":
+        graph = CompactSurfaceGraph.from_reference(cfg)
+        return _apply_shock_line_sensor_condition(cfg, x_raw[:, : cfg.input_dim_raw].astype(np.float32), graph, artifact)
     basis = _build_sensor_basis(x_raw[:, : cfg.input_dim_raw].astype(np.float32))
     return _apply_linear_sensor_basis(basis, artifact, cfg)
+
+
+def infer_mesh_teacher(
+    cfg: FullAircraftConfig,
+    input_path: Path | None = None,
+    output_path: Path | None = None,
+    max_rows: int | None = None,
+) -> Path:
+    cfg.ensure_dirs()
+    input_path = Path(input_path).expanduser().resolve() if input_path is not None else (cfg.cut_data_dir / "X_cut_test.npy")
+    output_path = Path(output_path).expanduser().resolve() if output_path is not None else _default_teacher_inference_output_path(cfg, input_path)
+    x_raw = np.load(input_path, mmap_mode="r")
+    graph = CompactSurfaceGraph.from_reference(cfg)
+    if x_raw.shape[0] % graph.n_points != 0:
+        raise ValueError("Input rows are not divisible by the reduced graph point count.")
+    if max_rows is not None:
+        x_raw = np.asarray(x_raw[:max_rows], dtype=np.float32)
+
+    expert_mean, expert_scale = _load_expert_scaler(cfg)
+    cp_mean, cp_scale = _load_cp_scaler(cfg)
+    model = _load_mesh_teacher(cfg)
+    edge_src, edge_dst, edge_attr = graph.edge_tensors(cfg.device)
+
+    n_rows = int(x_raw.shape[0])
+    n_conditions = int(n_rows // graph.n_points)
+    cp_pred = np.zeros((n_rows, 1), dtype=np.float32)
+    smooth_pred = np.zeros((n_rows, 1), dtype=np.float32)
+    shock_pred = np.zeros((n_rows, 1), dtype=np.float32)
+    shock_alpha = np.zeros((n_rows, 1), dtype=np.float32)
+
+    with torch.no_grad():
+        for cond_idx in range(n_conditions):
+            row_start = cond_idx * graph.n_points
+            row_stop = row_start + graph.n_points
+            x_chunk = np.asarray(x_raw[row_start:row_stop, : cfg.input_dim_raw], dtype=np.float32)
+            feat_flat = build_expert_features(x_chunk)
+            feat_flat = ((feat_flat - expert_mean) / expert_scale).astype(np.float32)
+            feat_tensor = torch.from_numpy(feat_flat[None, ...]).to(cfg.device, non_blocking=True)
+            mask_flat = torch.ones((1, graph.n_points, 1), device=cfg.device, dtype=torch.float32)
+            smooth_t, shock_t, alpha_teacher_t, _, _ = _forward_teacher(model, feat_tensor, edge_src, edge_dst, edge_attr, mask_flat)
+            smooth_flat = smooth_t[0].detach().cpu().numpy().astype(np.float32)
+            shock_flat = shock_t[0].detach().cpu().numpy().astype(np.float32)
+            alpha_flat = alpha_teacher_t[0].detach().cpu().numpy().astype(np.float32)
+            mixed_flat = (1.0 - alpha_flat) * smooth_flat + alpha_flat * shock_flat
+
+            smooth_pred[row_start:row_stop] = _destandardize(smooth_flat, cp_mean, cp_scale)
+            shock_pred[row_start:row_stop] = _destandardize(shock_flat, cp_mean, cp_scale)
+            cp_pred[row_start:row_stop] = _destandardize(mixed_flat, cp_mean, cp_scale)
+            shock_alpha[row_start:row_stop] = alpha_flat.astype(np.float32)
+
+            if cond_idx == 0 or cond_idx + 1 == n_conditions or cond_idx % 25 == 0:
+                print(f"[infer-mesh-teacher] condition {cond_idx + 1}/{n_conditions}")
+
+    np.savez_compressed(
+        output_path,
+        cp_pred=cp_pred.astype(np.float32),
+        smooth_pred=smooth_pred.astype(np.float32),
+        shock_pred=shock_pred.astype(np.float32),
+        shock_alpha=shock_alpha.astype(np.float32),
+        teacher_alpha=shock_alpha.astype(np.float32),
+        sensor_type=np.array(["mesh_teacher_alpha"], dtype=object),
+    )
+    print(f"[infer-mesh-teacher] Saved predictions to {output_path}")
+    return output_path
 
 
 def infer_mesh_symbolic(
@@ -626,7 +1021,10 @@ def infer_mesh_symbolic(
             smooth_flat = smooth_t[0].detach().cpu().numpy().astype(np.float32)
             shock_flat = shock_t[0].detach().cpu().numpy().astype(np.float32)
             teacher_alpha_flat = alpha_teacher_t[0].detach().cpu().numpy().astype(np.float32)
-            alpha_flat = apply_symbolic_mesh_sensor(cfg, x_chunk, artifact).reshape(-1, 1)
+            if str(artifact.get("type", "")) == "mesh_shock_line_symbolic":
+                alpha_flat = _apply_shock_line_sensor_condition(cfg, x_chunk, graph, artifact).reshape(-1, 1)
+            else:
+                alpha_flat = apply_symbolic_mesh_sensor(cfg, x_chunk, artifact).reshape(-1, 1)
             mixed_flat = (1.0 - alpha_flat) * smooth_flat + alpha_flat * shock_flat
 
             smooth_pred[row_start:row_stop] = _destandardize(smooth_flat, cp_mean, cp_scale)

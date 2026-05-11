@@ -131,39 +131,59 @@ def _gradient_loss(pred: torch.Tensor, target: torch.Tensor, weight_map: torch.T
     )
 
 
-def _shock_target_map_from_cp(cp_grid: torch.Tensor, mask: torch.Tensor, quantile: float) -> torch.Tensor:
-    grad_x = _finite_diff_x(cp_grid)
-    grad_y = _finite_diff_y(cp_grid)
+def _normalized_gradient_map_torch(field_grid: torch.Tensor, mask: torch.Tensor, quantile: float) -> torch.Tensor:
+    grad_x = _finite_diff_x(field_grid)
+    grad_y = _finite_diff_y(field_grid)
     grad_mag = torch.sqrt(grad_x.square() + grad_y.square() + 1e-12) * mask
     flat = grad_mag.flatten(1)
     flat_mask = mask.flatten(1) > 0.5
     scales: list[torch.Tensor] = []
-    for idx in range(cp_grid.shape[0]):
+    for idx in range(field_grid.shape[0]):
         valid = flat[idx][flat_mask[idx]]
         if valid.numel() == 0:
-            scales.append(torch.ones((), device=cp_grid.device, dtype=cp_grid.dtype))
+            scales.append(torch.ones((), device=field_grid.device, dtype=field_grid.dtype))
             continue
         scales.append(torch.quantile(valid, q=float(quantile)).clamp_min(1e-6))
     scale = torch.stack(scales).view(-1, 1, 1, 1)
     return torch.clamp(grad_mag / scale, 0.0, 1.0) * mask
 
 
-def _shock_target_map_numpy(cp_grid: np.ndarray, mask: np.ndarray, quantile: float) -> np.ndarray:
-    grad_y, grad_x = np.gradient(cp_grid.astype(np.float32), edge_order=1)
+def _shock_target_map_from_fields(
+    cp_grid: torch.Tensor,
+    cfx_grid: torch.Tensor,
+    mask: torch.Tensor,
+    quantile: float,
+    cfx_weight: float,
+) -> torch.Tensor:
+    cp_map = _normalized_gradient_map_torch(cp_grid, mask, quantile)
+    cfx_map = _normalized_gradient_map_torch(cfx_grid, mask, quantile)
+    return torch.clamp(cp_map + float(cfx_weight) * cfx_map, 0.0, 1.0) * mask
+
+
+def _normalized_gradient_map_numpy(field_grid: np.ndarray, mask: np.ndarray, quantile: float) -> np.ndarray:
+    grad_y, grad_x = np.gradient(field_grid.astype(np.float32), edge_order=1)
     grad_mag = np.sqrt(grad_x * grad_x + grad_y * grad_y) * mask
     valid = grad_mag[mask > 0.5]
     if valid.size == 0:
-        return np.zeros_like(cp_grid, dtype=np.float32)
+        return np.zeros_like(field_grid, dtype=np.float32)
     scale = float(np.quantile(valid, quantile))
     if scale <= 1e-6:
-        return np.zeros_like(cp_grid, dtype=np.float32)
+        return np.zeros_like(field_grid, dtype=np.float32)
     return np.clip(grad_mag / scale, 0.0, 1.0).astype(np.float32) * mask
+
+
+def _shock_target_map_numpy(cp_grid: np.ndarray, cfx_grid: np.ndarray, mask: np.ndarray, quantile: float, cfx_weight: float) -> np.ndarray:
+    cp_map = _normalized_gradient_map_numpy(cp_grid, mask, quantile)
+    cfx_map = _normalized_gradient_map_numpy(cfx_grid, mask, quantile)
+    return np.clip(cp_map + float(cfx_weight) * cfx_map, 0.0, 1.0).astype(np.float32) * mask
 
 
 class _ShockConditionDataset(Dataset):
     def __init__(self, cfg: FullAircraftConfig, split: str, grid: CompactSurfaceGrid):
         self.features = np.load(cfg.features_dir / f"expert_features_{split}.npy", mmap_mode="r")
         self.cp = np.load(cfg.features_dir / f"cp_{split}.npy", mmap_mode="r")
+        self.raw_outputs = np.load(cfg.reduced_data_dir / f"Y_cut_{split}.npy", mmap_mode="r")
+        self.cfg = cfg
         self.grid = grid
         self.points_per_condition = grid.n_points
         self.n_conditions = int(self.features.shape[0] // self.points_per_condition)
@@ -177,19 +197,25 @@ class _ShockConditionDataset(Dataset):
         row_stop = row_start + self.points_per_condition
         feat_flat = np.asarray(self.features[row_start:row_stop], dtype=np.float32)
         cp_flat = np.asarray(self.cp[row_start:row_stop], dtype=np.float32)
+        cp_raw_flat = np.asarray(self.raw_outputs[row_start:row_stop, [self.cfg.cp_column]], dtype=np.float32)
+        cfx_raw_flat = np.asarray(self.raw_outputs[row_start:row_stop, [self.cfg.cfx_column]], dtype=np.float32)
         feat_grid = self.grid.scatter_numpy(feat_flat)
         cp_grid = self.grid.scatter_numpy(cp_flat)
+        cp_raw_grid = self.grid.scatter_numpy(cp_raw_flat)
+        cfx_raw_grid = self.grid.scatter_numpy(cfx_raw_flat)
         feat_grid = np.concatenate([feat_grid, self.mask], axis=0)
         return (
             torch.from_numpy(feat_grid),
             torch.from_numpy(cp_grid),
+            torch.from_numpy(cp_raw_grid),
+            torch.from_numpy(cfx_raw_grid),
             torch.from_numpy(self.mask),
         )
 
 
 def _save_model_config(cfg: FullAircraftConfig, grid: CompactSurfaceGrid, input_channels: int) -> None:
     payload = {
-        "architecture": "shock_split_latent_unet_v2",
+        "architecture": "shock_residual_latent_unet_v3",
         "input_channels": int(input_channels),
         "base_channels": int(cfg.shock_local_base_channels),
         "latent_dim": int(cfg.latent_dim),
@@ -197,6 +223,7 @@ def _save_model_config(cfg: FullAircraftConfig, grid: CompactSurfaceGrid, input_
         "grid_width": int(grid.width),
         "points_per_condition": int(grid.n_points),
         "target_quantile": float(cfg.shock_local_target_quantile),
+        "cfx_weight": float(cfg.shock_local_cfx_weight),
     }
     with _model_config_path(cfg).open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
@@ -206,19 +233,29 @@ def _split_predictions(
     model: FullAircraftShockSplitUNet,
     feat: torch.Tensor,
     cp: torch.Tensor,
+    cp_raw: torch.Tensor,
+    cfx_raw: torch.Tensor,
     mask: torch.Tensor,
     cfg: FullAircraftConfig,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    smooth_pred, shock_pred, alpha_logits, latent_map = model(feat)
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    base_pred, delta_pred, alpha_logits, latent_map = model(feat)
     alpha_teacher = torch.sigmoid(alpha_logits) * mask
-    shock_target = _shock_target_map_from_cp(cp, mask, cfg.shock_local_target_quantile)
-    mixed_pred = (1.0 - alpha_teacher) * smooth_pred + alpha_teacher * shock_pred
-    return smooth_pred, shock_pred, alpha_teacher, mixed_pred, shock_target, latent_map
+    shock_target = _shock_target_map_from_fields(
+        cp_raw,
+        cfx_raw,
+        mask,
+        cfg.shock_local_target_quantile,
+        cfg.shock_local_cfx_weight,
+    )
+    shock_branch_pred = base_pred + delta_pred
+    mixed_pred = base_pred + alpha_teacher * delta_pred
+    return base_pred, delta_pred, shock_branch_pred, alpha_teacher, mixed_pred, shock_target, latent_map
 
 
 def _train_objective(
-    smooth_pred: torch.Tensor,
-    shock_pred: torch.Tensor,
+    base_pred: torch.Tensor,
+    delta_pred: torch.Tensor,
+    shock_branch_pred: torch.Tensor,
     alpha_teacher: torch.Tensor,
     mixed_pred: torch.Tensor,
     cp: torch.Tensor,
@@ -227,24 +264,49 @@ def _train_objective(
     cfg: FullAircraftConfig,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     mixed_loss = _masked_weighted_smooth_l1(mixed_pred, cp, mask)
-    smooth_loss = _masked_weighted_smooth_l1(smooth_pred, cp, (1.0 - shock_target) * mask)
-    shock_loss = _masked_weighted_smooth_l1(shock_pred, cp, shock_target * mask)
+    base_zone = ((1.0 - shock_target) + 0.15 * shock_target) * mask
+    shock_zone = shock_target * mask
+    smooth_loss = _masked_weighted_smooth_l1(base_pred, cp, base_zone)
+    shock_loss = _masked_weighted_smooth_l1(shock_branch_pred, cp, shock_zone)
+    residual_target = (cp - base_pred.detach()) * shock_target
+    residual_loss = _masked_weighted_smooth_l1(delta_pred, residual_target, shock_zone)
+    delta_suppress_loss = _masked_weighted_smooth_l1(delta_pred, torch.zeros_like(delta_pred), (1.0 - shock_target) * mask)
     alpha_loss = _masked_weighted_smooth_l1(alpha_teacher, shock_target, mask)
     grad_weight = (1.0 + float(cfg.expert_shock_weight) * shock_target) * mask
     grad_loss = _gradient_loss(mixed_pred, cp, grad_weight, mask)
+    base_err = torch.abs(base_pred - cp)
+    shock_err = torch.abs(shock_branch_pred - cp)
+    margin = float(cfg.shock_local_specialization_margin)
+    shock_margin_loss = _masked_weighted_smooth_l1(
+        torch.relu(shock_err - base_err + margin),
+        torch.zeros_like(base_err),
+        shock_zone,
+    )
+    smooth_margin_loss = _masked_weighted_smooth_l1(
+        torch.relu(base_err - shock_err + margin),
+        torch.zeros_like(base_err),
+        (1.0 - shock_target) * mask,
+    )
+    margin_loss = 0.5 * (shock_margin_loss + smooth_margin_loss)
     total = (
         float(cfg.shock_local_mixed_loss_weight) * mixed_loss
         + float(cfg.shock_local_smooth_head_weight) * smooth_loss
         + float(cfg.shock_local_shock_head_weight) * shock_loss
+        + float(cfg.shock_local_residual_loss_weight) * residual_loss
+        + float(cfg.shock_local_delta_suppress_weight) * delta_suppress_loss
         + float(cfg.shock_local_alpha_loss_weight) * alpha_loss
         + float(cfg.shock_local_grad_loss_weight) * grad_loss
+        + float(cfg.shock_local_margin_loss_weight) * margin_loss
     )
     return total, {
         "mixed": float(mixed_loss.item()),
-        "smooth": float(smooth_loss.item()),
+        "base": float(smooth_loss.item()),
         "shock": float(shock_loss.item()),
+        "residual": float(residual_loss.item()),
+        "suppress": float(delta_suppress_loss.item()),
         "alpha": float(alpha_loss.item()),
         "grad": float(grad_loss.item()),
+        "margin": float(margin_loss.item()),
     }
 
 
@@ -265,11 +327,15 @@ def _evaluate_model(
     total_shock_best = 0.0
     n_batches = 0
     with torch.no_grad():
-        for feat, cp, mask in loader:
+        for feat, cp, cp_raw, cfx_raw, mask in loader:
             feat = feat.to(cfg.device, non_blocking=True)
             cp = cp.to(cfg.device, non_blocking=True)
+            cp_raw = cp_raw.to(cfg.device, non_blocking=True)
+            cfx_raw = cfx_raw.to(cfg.device, non_blocking=True)
             mask = mask.to(cfg.device, non_blocking=True)
-            smooth_pred, shock_pred, alpha_teacher, mixed_pred, shock_target, _ = _split_predictions(model, feat, cp, mask, cfg)
+            base_pred, delta_pred, shock_branch_pred, alpha_teacher, mixed_pred, shock_target, _ = _split_predictions(
+                model, feat, cp, cp_raw, cfx_raw, mask, cfg
+            )
 
             mixed_mae = _masked_mae(mixed_pred, cp, mask)
             rmse = torch.sqrt((((mixed_pred - cp) * mask).square().flatten(1).sum(dim=1) / mask.flatten(1).sum(dim=1).clamp_min(1.0)).mean())
@@ -277,13 +343,13 @@ def _evaluate_model(
 
             smooth_zone = ((shock_target < cfg.shock_local_binary_threshold).float()) * mask
             shock_zone = ((shock_target >= cfg.shock_local_binary_threshold).float()) * mask
-            smooth_zone_smooth = _masked_mae(smooth_pred, cp, smooth_zone)
-            smooth_zone_shock = _masked_mae(shock_pred, cp, smooth_zone)
-            shock_zone_smooth = _masked_mae(smooth_pred, cp, shock_zone)
-            shock_zone_shock = _masked_mae(shock_pred, cp, shock_zone)
+            smooth_zone_smooth = _masked_mae(base_pred, cp, smooth_zone)
+            smooth_zone_shock = _masked_mae(shock_branch_pred, cp, smooth_zone)
+            shock_zone_smooth = _masked_mae(base_pred, cp, shock_zone)
+            shock_zone_shock = _masked_mae(shock_branch_pred, cp, shock_zone)
 
-            smooth_abs = torch.abs(smooth_pred - cp)
-            shock_abs = torch.abs(shock_pred - cp)
+            smooth_abs = torch.abs(base_pred - cp)
+            shock_abs = torch.abs(shock_branch_pred - cp)
             smooth_best = (((smooth_abs <= shock_abs).float() * smooth_zone).flatten(1).sum(dim=1) / smooth_zone.flatten(1).sum(dim=1).clamp_min(1.0)).mean()
             shock_best = (((shock_abs <= smooth_abs).float() * shock_zone).flatten(1).sum(dim=1) / shock_zone.flatten(1).sum(dim=1).clamp_min(1.0)).mean()
 
@@ -355,14 +421,21 @@ def _build_shock_target_array(cfg: FullAircraftConfig, split: str, grid: Compact
     if target_path.exists():
         return np.load(target_path, mmap_mode="r")
 
-    cp = np.load(cfg.features_dir / f"cp_{split}.npy", mmap_mode="r")
-    n_conditions = int(cp.shape[0] // grid.n_points)
-    alpha = np.zeros((cp.shape[0], 1), dtype=np.float32)
+    raw_outputs = np.load(cfg.reduced_data_dir / f"Y_cut_{split}.npy", mmap_mode="r")
+    n_conditions = int(raw_outputs.shape[0] // grid.n_points)
+    alpha = np.zeros((raw_outputs.shape[0], 1), dtype=np.float32)
     for cond_idx in range(n_conditions):
         row_start = cond_idx * grid.n_points
         row_stop = row_start + grid.n_points
-        cp_grid = grid.scatter_numpy(np.asarray(cp[row_start:row_stop], dtype=np.float32))[0]
-        alpha_grid = _shock_target_map_numpy(cp_grid, grid.valid_mask, cfg.shock_local_target_quantile)
+        cp_grid = grid.scatter_numpy(np.asarray(raw_outputs[row_start:row_stop, [cfg.cp_column]], dtype=np.float32))[0]
+        cfx_grid = grid.scatter_numpy(np.asarray(raw_outputs[row_start:row_stop, [cfg.cfx_column]], dtype=np.float32))[0]
+        alpha_grid = _shock_target_map_numpy(
+            cp_grid,
+            cfx_grid,
+            grid.valid_mask,
+            cfg.shock_local_target_quantile,
+            cfg.shock_local_cfx_weight,
+        )
         alpha[row_start:row_stop, 0] = grid.gather_numpy(alpha_grid[None, ...])[:, 0]
         if cond_idx == 0 or cond_idx + 1 == n_conditions or cond_idx % 25 == 0:
             print(f"[shock-target] {split}: condition {cond_idx + 1}/{n_conditions}")
@@ -381,7 +454,7 @@ def _build_teacher_alpha_array(
     alpha = np.zeros((dataset.n_conditions * grid.n_points, 1), dtype=np.float32)
     with torch.no_grad():
         for cond_idx in range(dataset.n_conditions):
-            feat, _, mask = dataset[cond_idx]
+            feat, _, _, _, mask = dataset[cond_idx]
             feat_t = feat.unsqueeze(0).to(cfg.device, non_blocking=True)
             mask_t = mask.unsqueeze(0).to(cfg.device, non_blocking=True)
             _, _, alpha_logits, _ = model(feat_t)
@@ -524,20 +597,39 @@ def train_shock_experts(cfg: FullAircraftConfig) -> None:
         total_objective = 0.0
         total_batches = 0
         pbar = tqdm(train_loader, desc=f"[shock-experts] epoch {epoch}/{cfg.shock_local_epochs}")
-        for feat, cp, mask in pbar:
+        for feat, cp, cp_raw, cfx_raw, mask in pbar:
             feat = feat.to(cfg.device, non_blocking=True)
             cp = cp.to(cfg.device, non_blocking=True)
+            cp_raw = cp_raw.to(cfg.device, non_blocking=True)
+            cfx_raw = cfx_raw.to(cfg.device, non_blocking=True)
             mask = mask.to(cfg.device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            smooth_pred, shock_pred, alpha_teacher, mixed_pred, shock_target, _ = _split_predictions(model, feat, cp, mask, cfg)
-            loss, terms = _train_objective(smooth_pred, shock_pred, alpha_teacher, mixed_pred, cp, mask, shock_target, cfg)
+            base_pred, delta_pred, shock_branch_pred, alpha_teacher, mixed_pred, shock_target, _ = _split_predictions(
+                model, feat, cp, cp_raw, cfx_raw, mask, cfg
+            )
+            loss, terms = _train_objective(
+                base_pred,
+                delta_pred,
+                shock_branch_pred,
+                alpha_teacher,
+                mixed_pred,
+                cp,
+                mask,
+                shock_target,
+                cfg,
+            )
             loss.backward()
             optimizer.step()
 
             total_objective += float(loss.item())
             total_batches += 1
-            pbar.set_postfix(loss=f"{loss.item():.5f}", mix=f"{terms['mixed']:.5f}", alpha=f"{terms['alpha']:.5f}", grad=f"{terms['grad']:.5f}")
+            pbar.set_postfix(
+                loss=f"{loss.item():.5f}",
+                mix=f"{terms['mixed']:.5f}",
+                resid=f"{terms['residual']:.5f}",
+                alpha=f"{terms['alpha']:.5f}",
+            )
 
         scheduler.step()
         train_objective = total_objective / max(1, total_batches)
@@ -558,7 +650,7 @@ def train_shock_experts(cfg: FullAircraftConfig) -> None:
     save_json(
         _training_metrics_path(cfg),
         {
-            "architecture": "shock_split_latent_unet_v2",
+            "architecture": "shock_residual_latent_unet_v3",
             "surface": cfg.reduced_surface,
             "final_train_objective": float(train_objective_hist[-1]),
             "final_test_mixed_mae": float(test_mae_hist[-1]),
@@ -567,9 +659,13 @@ def train_shock_experts(cfg: FullAircraftConfig) -> None:
             "shock_local_base_channels": int(cfg.shock_local_base_channels),
             "latent_dim": int(cfg.latent_dim),
             "shock_local_target_quantile": float(cfg.shock_local_target_quantile),
+            "shock_local_cfx_weight": float(cfg.shock_local_cfx_weight),
             "shock_local_binary_threshold": float(cfg.shock_local_binary_threshold),
             "shock_local_alpha_loss_weight": float(cfg.shock_local_alpha_loss_weight),
             "shock_local_grad_loss_weight": float(cfg.shock_local_grad_loss_weight),
+            "shock_local_residual_loss_weight": float(cfg.shock_local_residual_loss_weight),
+            "shock_local_delta_suppress_weight": float(cfg.shock_local_delta_suppress_weight),
+            "shock_local_margin_loss_weight": float(cfg.shock_local_margin_loss_weight),
         },
     )
     _plot_training_curves(cfg, train_objective_hist, test_mae_hist)
@@ -688,12 +784,13 @@ def infer_shock_symbolic(
             feat_grid = grid.scatter_numpy(feat_chunk)
             feat_grid = np.concatenate([feat_grid, mask], axis=0)[None, ...]
             feat_tensor = torch.from_numpy(feat_grid).to(cfg.device, non_blocking=True)
-            smooth_grid_t, shock_grid_t, alpha_logits_t, _ = model(feat_tensor)
-            smooth_flat = grid.gather_numpy(smooth_grid_t.detach().cpu().numpy())[0]
-            shock_flat = grid.gather_numpy(shock_grid_t.detach().cpu().numpy())[0]
+            base_grid_t, delta_grid_t, alpha_logits_t, _ = model(feat_tensor)
+            smooth_flat = grid.gather_numpy(base_grid_t.detach().cpu().numpy())[0]
+            delta_flat = grid.gather_numpy(delta_grid_t.detach().cpu().numpy())[0]
+            shock_flat = smooth_flat + delta_flat
             teacher_alpha_flat = grid.gather_numpy((torch.sigmoid(alpha_logits_t) * feat_tensor[:, -1:, :, :]).detach().cpu().numpy())[0]
             alpha_flat = apply_symbolic_shock_sensor(cfg, x_chunk, artifact).reshape(-1, 1)
-            mixed_flat = (1.0 - alpha_flat) * smooth_flat + alpha_flat * shock_flat
+            mixed_flat = smooth_flat + alpha_flat * delta_flat
 
             smooth_pred[row_start:row_stop] = _destandardize(smooth_flat, cp_mean, cp_scale)
             shock_pred[row_start:row_stop] = _destandardize(shock_flat, cp_mean, cp_scale)

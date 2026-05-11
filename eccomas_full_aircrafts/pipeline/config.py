@@ -104,6 +104,11 @@ class FullAircraftConfig:
     shock_local_shock_head_weight: float = 0.65
     shock_local_alpha_loss_weight: float = 0.30
     shock_local_grad_loss_weight: float = 0.20
+    shock_local_cfx_weight: float = 0.30
+    shock_local_residual_loss_weight: float = 0.50
+    shock_local_delta_suppress_weight: float = 0.10
+    shock_local_margin_loss_weight: float = 0.10
+    shock_local_specialization_margin: float = 0.02
     shock_symbolic_max_samples: int = 250_000
     shock_symbolic_ridge_alpha: float = 1e-2
 
@@ -123,6 +128,10 @@ class FullAircraftConfig:
     mesh_teacher_cfx_weight: float = 0.30
     mesh_symbolic_max_samples: int = 250_000
     mesh_symbolic_ridge_alpha: float = 1e-2
+    mesh_shock_line_activation_threshold: float = 0.20
+    mesh_shock_line_weight_power: float = 2.0
+    mesh_shock_line_width_floor: float = 0.30
+    mesh_shock_line_width_ceiling: float = 6.0
 
     def __post_init__(self) -> None:
         default_project_root = Path(__file__).resolve().parents[2]

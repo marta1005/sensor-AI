@@ -65,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "train-mesh-teacher",
         parents=[common],
-        help="Train a MeshGraphNet-style teacher with a local latent bottleneck and smooth/shock heads",
+        help="Train a MeshGraphNet-style teacher with a local latent bottleneck, direct Cp head, and auxiliary shock head",
     )
 
     subparsers.add_parser(
@@ -77,7 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "distill-mesh-sensor",
         parents=[common],
-        help="Distill the MeshGraphNet teacher alpha into a symbolic shock-line sensor",
+        help="Distill the MeshGraphNet auxiliary shock head into a symbolic shock-line sensor",
     )
 
     shock_infer_parser = subparsers.add_parser(
@@ -92,7 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
     mesh_infer_parser = subparsers.add_parser(
         "infer-mesh-symbolic",
         parents=[common],
-        help="Infer Cp with the MeshGraphNet teacher heads mixed by the symbolic shock-line sensor",
+        help="Infer Cp with the direct MeshGraphNet teacher and export the symbolic shock-line sensor side by side",
     )
     mesh_infer_parser.add_argument("--input-path", type=str, default=None)
     mesh_infer_parser.add_argument("--output-path", type=str, default=None)
@@ -101,7 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
     mesh_teacher_infer_parser = subparsers.add_parser(
         "infer-mesh-teacher",
         parents=[common],
-        help="Infer Cp with the MeshGraphNet teacher using the teacher alpha directly",
+        help="Infer Cp and auxiliary shock activation directly from the MeshGraphNet teacher",
     )
     mesh_teacher_infer_parser.add_argument("--input-path", type=str, default=None)
     mesh_teacher_infer_parser.add_argument("--output-path", type=str, default=None)

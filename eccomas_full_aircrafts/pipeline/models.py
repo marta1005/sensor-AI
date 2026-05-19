@@ -293,7 +293,7 @@ class _MeshMessagePassingLayer(nn.Module):
 
 
 class FullAircraftMeshTeacher(nn.Module):
-    """Graph teacher with a local latent bottleneck and smooth/shock heads."""
+    """Graph teacher with a local latent bottleneck, direct Cp head, and auxiliary shock head."""
 
     def __init__(
         self,
@@ -321,13 +321,8 @@ class FullAircraftMeshTeacher(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, latent_dim),
         )
-        self.alpha_head = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim),
-            nn.SiLU(),
-            nn.Linear(latent_dim, 1),
-        )
         head_input_dim = hidden_dim + latent_dim
-        self.smooth_head = nn.Sequential(
+        self.cp_head = nn.Sequential(
             nn.Linear(head_input_dim, hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, 1),
@@ -344,16 +339,15 @@ class FullAircraftMeshTeacher(nn.Module):
         edge_src: torch.Tensor,
         edge_dst: torch.Tensor,
         edge_attr: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         hidden = self.node_encoder(node_features)
         for layer in self.layers:
             hidden = layer(hidden, edge_src=edge_src, edge_dst=edge_dst, edge_attr=edge_attr)
         latent = self.to_latent(hidden)
-        alpha_logits = self.alpha_head(latent)
         head_input = torch.cat([hidden, latent], dim=-1)
-        smooth = self.smooth_head(head_input)
-        shock = self.shock_head(head_input)
-        return smooth, shock, alpha_logits, latent
+        cp = self.cp_head(head_input)
+        shock_logits = self.shock_head(head_input)
+        return cp, shock_logits, latent
 
 
 class FullAircraftLatentMixer(nn.Module):

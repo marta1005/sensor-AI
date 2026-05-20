@@ -50,16 +50,17 @@ class CompactSurfaceGraph:
         ).astype(np.float32)
 
         lookup = {(int(r), int(c)): idx for idx, (r, c) in enumerate(zip(row_idx.tolist(), col_idx.tolist()))}
-        offsets = [
-            (-1, -1),
-            (-1, 0),
-            (-1, 1),
-            (0, -1),
-            (0, 1),
-            (1, -1),
-            (1, 0),
-            (1, 1),
-        ]
+        offsets: list[tuple[int, int]] = []
+        for dc in cfg.mesh_graph_x_dilations:
+            step = int(abs(dc))
+            if step == 0:
+                continue
+            offsets.append((0, -step))
+            offsets.append((0, step))
+        offsets.extend([(-1, 0), (1, 0)])
+        if cfg.mesh_graph_include_diagonals:
+            offsets.extend([(-1, -1), (-1, 1), (1, -1), (1, 1)])
+        offsets = list(dict.fromkeys(offsets))
         edge_src: list[int] = []
         edge_dst: list[int] = []
         edge_attr: list[list[float]] = []

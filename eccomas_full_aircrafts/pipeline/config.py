@@ -124,6 +124,14 @@ class FullAircraftConfig:
     mesh_teacher_shock_loss_weight: float = 0.35
     mesh_teacher_grad_loss_weight: float = 0.20
     mesh_teacher_cfx_weight: float = 0.30
+    mesh_teacher_shock_band_width: float = 0.45
+    mesh_teacher_shock_presence_threshold: float = 0.20
+    mesh_teacher_shock_weight_power: float = 2.0
+    mesh_teacher_shock_focal_gamma: float = 2.0
+    mesh_teacher_shock_bce_weight: float = 0.75
+    mesh_teacher_shock_dice_weight: float = 0.25
+    mesh_graph_x_dilations: tuple[int, ...] = (1, 2, 4)
+    mesh_graph_include_diagonals: bool = True
     mesh_symbolic_max_samples: int = 250_000
     mesh_symbolic_ridge_alpha: float = 1e-2
     mesh_shock_line_activation_threshold: float = 0.20

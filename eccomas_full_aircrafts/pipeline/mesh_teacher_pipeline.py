@@ -80,6 +80,10 @@ def _teacher_shock_path(cfg: FullAircraftConfig, split: str) -> Path:
     return cfg.features_dir / f"mesh_teacher_shock_{split}.npy"
 
 
+def _shock_target_meta_path(cfg: FullAircraftConfig, split: str) -> Path:
+    return cfg.features_dir / f"mesh_shock_target_{split}_meta.json"
+
+
 def _default_inference_output_path(cfg: FullAircraftConfig, input_path: Path) -> Path:
     return cfg.inference_dir / f"{input_path.stem}_mesh_symbolic.npz"
 
@@ -122,6 +126,30 @@ def _masked_mae(pred: torch.Tensor, target: torch.Tensor, weight_map: torch.Tens
     return (loss.flatten(1).sum(dim=1) / denom).mean()
 
 
+def _masked_focal_bce_with_logits(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    weight_map: torch.Tensor,
+    gamma: float,
+) -> torch.Tensor:
+    bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    prob = torch.sigmoid(logits)
+    pt = target * prob + (1.0 - target) * (1.0 - prob)
+    focal = ((1.0 - pt).clamp_min(1e-6) ** float(gamma)) * bce * weight_map
+    denom = weight_map.flatten(1).sum(dim=1).clamp_min(1.0)
+    return (focal.flatten(1).sum(dim=1) / denom).mean()
+
+
+def _masked_soft_dice_loss(
+    prob: torch.Tensor,
+    target: torch.Tensor,
+    weight_map: torch.Tensor,
+) -> torch.Tensor:
+    numer = 2.0 * (prob * target * weight_map).flatten(1).sum(dim=1) + 1e-6
+    denom = ((prob + target) * weight_map).flatten(1).sum(dim=1) + 1e-6
+    return (1.0 - numer / denom).mean()
+
+
 def _gradient_loss(pred_grid: torch.Tensor, target_grid: torch.Tensor, weight_map: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     pred_dx = _finite_diff_x(pred_grid)
     pred_dy = _finite_diff_y(pred_grid)
@@ -150,6 +178,39 @@ def _normalized_gradient_map(field_grid: np.ndarray, mask: np.ndarray, quantile:
     return np.clip(grad_mag / scale, 0.0, 1.0).astype(np.float32) * mask
 
 
+def _shock_line_target_from_score_map(
+    score_map: np.ndarray,
+    x_grid: np.ndarray,
+    mask: np.ndarray,
+    activation_threshold: float,
+    weight_power: float,
+    band_width: float,
+) -> np.ndarray:
+    height, width = score_map.shape
+    target = np.zeros((height, width), dtype=np.float32)
+    min_width = max(float(band_width), 1e-3)
+    for row in range(height):
+        valid = mask[row] > 0.5
+        if not np.any(valid):
+            continue
+        row_score = score_map[row, valid].astype(np.float32)
+        if row_score.size == 0:
+            continue
+        peak = float(np.max(row_score))
+        if peak < float(activation_threshold):
+            continue
+        row_x = x_grid[row, valid].astype(np.float32)
+        weights = np.maximum(row_score - float(activation_threshold), 0.0) ** float(weight_power)
+        if float(np.sum(weights)) <= 1e-8:
+            weights = np.maximum(row_score, 0.0) ** float(weight_power)
+        if float(np.sum(weights)) <= 1e-8:
+            continue
+        center = float(np.sum(weights * row_x) / np.sum(weights))
+        row_target = peak * np.exp(-0.5 * ((row_x - center) / min_width) ** 2)
+        target[row, valid] = np.clip(row_target, 0.0, 1.0)
+    return target.astype(np.float32) * mask
+
+
 def _shock_target_map_numpy(cp_grid: np.ndarray, cfx_grid: np.ndarray, mask: np.ndarray, quantile: float, cfx_weight: float) -> np.ndarray:
     cp_map = _normalized_gradient_map(cp_grid, mask, quantile)
     cfx_map = _normalized_gradient_map(cfx_grid, mask, quantile)
@@ -158,13 +219,29 @@ def _shock_target_map_numpy(cp_grid: np.ndarray, cfx_grid: np.ndarray, mask: np.
 
 def _build_shock_target_array(cfg: FullAircraftConfig, split: str, graph: CompactSurfaceGraph) -> np.ndarray:
     target_path = cfg.features_dir / f"mesh_shock_target_{split}.npy"
+    meta_path = _shock_target_meta_path(cfg, split)
     y_red = np.load(cfg.reduced_data_dir / f"Y_cut_{split}.npy", mmap_mode="r")
     expected_rows = int(y_red.shape[0])
+    expected_meta = {
+        "rows": expected_rows,
+        "points_per_condition": int(graph.n_points),
+        "shock_quantile": float(cfg.mesh_teacher_shock_quantile),
+        "cfx_weight": float(cfg.mesh_teacher_cfx_weight),
+        "band_width": float(cfg.mesh_teacher_shock_band_width),
+        "presence_threshold": float(cfg.mesh_teacher_shock_presence_threshold),
+        "weight_power": float(cfg.mesh_teacher_shock_weight_power),
+    }
     if target_path.exists():
         cached = np.load(target_path, mmap_mode="r")
-        if int(cached.shape[0]) == expected_rows:
+        cached_meta = None
+        if meta_path.exists():
+            with meta_path.open("r", encoding="utf-8") as handle:
+                cached_meta = json.load(handle)
+        if int(cached.shape[0]) == expected_rows and cached_meta == expected_meta:
             return cached
         target_path.unlink()
+        if meta_path.exists():
+            meta_path.unlink()
 
     n_conditions = int(y_red.shape[0] // graph.n_points)
     alpha = np.zeros((y_red.shape[0], 1), dtype=np.float32)
@@ -173,17 +250,28 @@ def _build_shock_target_array(cfg: FullAircraftConfig, split: str, graph: Compac
         row_stop = row_start + graph.n_points
         cp_grid = graph.scatter_numpy(np.asarray(y_red[row_start:row_stop, [cfg.cp_column]], dtype=np.float32))[0]
         cfx_grid = graph.scatter_numpy(np.asarray(y_red[row_start:row_stop, [cfg.cfx_column]], dtype=np.float32))[0]
-        alpha_grid = _shock_target_map_numpy(
+        score_grid = _shock_target_map_numpy(
             cp_grid,
             cfx_grid,
             graph.valid_mask,
             cfg.mesh_teacher_shock_quantile,
             cfg.mesh_teacher_cfx_weight,
         )
+        x_grid = graph.scatter_numpy(graph.coords[:, [0]])[0]
+        alpha_grid = _shock_line_target_from_score_map(
+            score_grid,
+            x_grid,
+            graph.valid_mask,
+            cfg.mesh_teacher_shock_presence_threshold,
+            cfg.mesh_teacher_shock_weight_power,
+            cfg.mesh_teacher_shock_band_width,
+        )
         alpha[row_start:row_stop, 0] = graph.gather_numpy(alpha_grid[None, ...])[:, 0]
         if cond_idx == 0 or cond_idx + 1 == n_conditions or cond_idx % 25 == 0:
             print(f"[mesh-shock-target] {split}: condition {cond_idx + 1}/{n_conditions}")
     np.save(target_path, alpha.astype(np.float32))
+    with meta_path.open("w", encoding="utf-8") as handle:
+        json.dump(expected_meta, handle, indent=2)
     return np.load(target_path, mmap_mode="r")
 
 
@@ -214,7 +302,7 @@ class _MeshConditionDataset(Dataset):
 
 def _save_model_config(cfg: FullAircraftConfig, graph: CompactSurfaceGraph, input_dim: int) -> None:
     payload = {
-        "architecture": "mesh_teacher_cp_shock_v2",
+        "architecture": "mesh_teacher_cp_shock_v3",
         "input_dim": int(input_dim),
         "hidden_dim": int(cfg.mesh_teacher_hidden_dim),
         "latent_dim": int(cfg.latent_dim),
@@ -225,6 +313,14 @@ def _save_model_config(cfg: FullAircraftConfig, graph: CompactSurfaceGraph, inpu
         "width": int(graph.width),
         "shock_quantile": float(cfg.mesh_teacher_shock_quantile),
         "cfx_weight": float(cfg.mesh_teacher_cfx_weight),
+        "shock_band_width": float(cfg.mesh_teacher_shock_band_width),
+        "shock_presence_threshold": float(cfg.mesh_teacher_shock_presence_threshold),
+        "shock_weight_power": float(cfg.mesh_teacher_shock_weight_power),
+        "shock_focal_gamma": float(cfg.mesh_teacher_shock_focal_gamma),
+        "shock_bce_weight": float(cfg.mesh_teacher_shock_bce_weight),
+        "shock_dice_weight": float(cfg.mesh_teacher_shock_dice_weight),
+        "x_dilations": [int(v) for v in cfg.mesh_graph_x_dilations],
+        "include_diagonals": bool(cfg.mesh_graph_include_diagonals),
         "cp_loss_weight": float(cfg.mesh_teacher_cp_loss_weight),
         "shock_loss_weight": float(cfg.mesh_teacher_shock_loss_weight),
         "grad_loss_weight": float(cfg.mesh_teacher_grad_loss_weight),
@@ -567,23 +663,34 @@ def _forward_teacher(
     edge_dst: torch.Tensor,
     edge_attr: torch.Tensor,
     mask_flat: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     cp_pred, shock_logits, latent = model(feat, edge_src=edge_src, edge_dst=edge_dst, edge_attr=edge_attr)
     shock_pred = torch.sigmoid(shock_logits) * mask_flat
-    return cp_pred, shock_pred, latent
+    return cp_pred, shock_logits, shock_pred, latent
 
 
 def _teacher_loss(
     cfg: FullAircraftConfig,
     graph: CompactSurfaceGraph,
     cp_pred: torch.Tensor,
+    shock_logits: torch.Tensor,
     shock_pred: torch.Tensor,
     cp: torch.Tensor,
     shock_target: torch.Tensor,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     mask_flat = torch.ones_like(cp)
     cp_loss = _masked_weighted_smooth_l1(cp_pred, cp, mask_flat)
-    shock_loss = _masked_weighted_smooth_l1(shock_pred, shock_target, mask_flat)
+    focal_loss = _masked_focal_bce_with_logits(
+        shock_logits,
+        shock_target,
+        mask_flat,
+        cfg.mesh_teacher_shock_focal_gamma,
+    )
+    dice_loss = _masked_soft_dice_loss(shock_pred, shock_target, mask_flat)
+    shock_loss = (
+        float(cfg.mesh_teacher_shock_bce_weight) * focal_loss
+        + float(cfg.mesh_teacher_shock_dice_weight) * dice_loss
+    )
 
     pred_grid = graph.scatter_tensor(cp_pred)
     cp_grid = graph.scatter_tensor(cp)
@@ -600,6 +707,8 @@ def _teacher_loss(
     return total, {
         "cp": float(cp_loss.item()),
         "shock": float(shock_loss.item()),
+        "shock_focal": float(focal_loss.item()),
+        "shock_dice": float(dice_loss.item()),
         "grad": float(grad_loss.item()),
     }
 
@@ -621,7 +730,7 @@ def _evaluate_teacher(cfg: FullAircraftConfig, graph: CompactSurfaceGraph, model
             cp = cp.to(cfg.device, non_blocking=True)
             shock_target = shock_target.to(cfg.device, non_blocking=True)
             mask_flat = torch.ones_like(cp)
-            cp_pred, shock_pred, _ = _forward_teacher(model, feat, edge_src, edge_dst, edge_attr, mask_flat)
+            cp_pred, _, shock_pred, _ = _forward_teacher(model, feat, edge_src, edge_dst, edge_attr, mask_flat)
             cp_mae = _masked_mae(cp_pred, cp, mask_flat)
             rmse = torch.sqrt(torch.mean((cp_pred - cp).square()))
             shock_mae = _masked_mae(shock_pred, shock_target, mask_flat)
@@ -716,13 +825,18 @@ def train_mesh_teacher(cfg: FullAircraftConfig) -> None:
             shock_target = shock_target.to(cfg.device, non_blocking=True)
             mask_flat = torch.ones_like(cp)
             optimizer.zero_grad(set_to_none=True)
-            cp_pred, shock_pred, _ = _forward_teacher(model, feat, edge_src, edge_dst, edge_attr, mask_flat)
-            loss, terms = _teacher_loss(cfg, graph, cp_pred, shock_pred, cp, shock_target)
+            cp_pred, shock_logits, shock_pred, _ = _forward_teacher(model, feat, edge_src, edge_dst, edge_attr, mask_flat)
+            loss, terms = _teacher_loss(cfg, graph, cp_pred, shock_logits, shock_pred, cp, shock_target)
             loss.backward()
             optimizer.step()
             total_objective += float(loss.item())
             total_batches += 1
-            pbar.set_postfix(loss=f"{loss.item():.5f}", cp=f"{terms['cp']:.5f}", shock=f"{terms['shock']:.5f}")
+            pbar.set_postfix(
+                loss=f"{loss.item():.5f}",
+                cp=f"{terms['cp']:.5f}",
+                shock=f"{terms['shock']:.5f}",
+                focal=f"{terms['shock_focal']:.5f}",
+            )
         scheduler.step()
         train_objective = total_objective / max(1, total_batches)
         test_metrics = _evaluate_teacher(cfg, graph, model, test_loader)
@@ -741,7 +855,7 @@ def train_mesh_teacher(cfg: FullAircraftConfig) -> None:
     save_json(
         _training_metrics_path(cfg),
         {
-            "architecture": "mesh_teacher_cp_shock_v2",
+            "architecture": "mesh_teacher_cp_shock_v3",
             "surface": cfg.reduced_surface,
             "final_train_objective": float(train_objective_hist[-1]),
             "final_test_cp_mae": float(test_mae_hist[-1]),
@@ -763,10 +877,10 @@ def train_mesh_teacher(cfg: FullAircraftConfig) -> None:
 def _load_mesh_teacher(cfg: FullAircraftConfig) -> FullAircraftMeshTeacher:
     config = json.loads(_model_config_path(cfg).read_text())
     architecture = str(config.get("architecture", "mesh_teacher_v1"))
-    if architecture != "mesh_teacher_cp_shock_v2":
+    if architecture != "mesh_teacher_cp_shock_v3":
         raise ValueError(
             f"Stored mesh teacher architecture is {architecture!r}, but the current pipeline expects "
-            "'mesh_teacher_cp_shock_v2'. Re-run 'train-mesh-teacher' before distilling or inferring."
+            "'mesh_teacher_cp_shock_v3'. Re-run 'train-mesh-teacher' before distilling or inferring."
         )
     model = FullAircraftMeshTeacher(
         input_dim=int(config["input_dim"]),
@@ -792,7 +906,7 @@ def _build_teacher_shock_array(cfg: FullAircraftConfig, split: str, graph: Compa
             feat, _, _ = dataset[cond_idx]
             feat_t = feat.unsqueeze(0).to(cfg.device, non_blocking=True)
             mask_flat = torch.ones((1, graph.n_points, 1), device=cfg.device, dtype=torch.float32)
-            _, shock_teacher, _ = _forward_teacher(model, feat_t, edge_src, edge_dst, edge_attr, mask_flat)
+            _, _, shock_teacher, _ = _forward_teacher(model, feat_t, edge_src, edge_dst, edge_attr, mask_flat)
             row_start = cond_idx * graph.n_points
             row_stop = row_start + graph.n_points
             shock[row_start:row_stop, 0] = shock_teacher[0, :, 0].detach().cpu().numpy().astype(np.float32)
@@ -955,7 +1069,7 @@ def infer_mesh_teacher(
             feat_flat = ((feat_flat - expert_mean) / expert_scale).astype(np.float32)
             feat_tensor = torch.from_numpy(feat_flat[None, ...]).to(cfg.device, non_blocking=True)
             mask_flat = torch.ones((1, graph.n_points, 1), device=cfg.device, dtype=torch.float32)
-            cp_t, shock_t, _ = _forward_teacher(model, feat_tensor, edge_src, edge_dst, edge_attr, mask_flat)
+            cp_t, _, shock_t, _ = _forward_teacher(model, feat_tensor, edge_src, edge_dst, edge_attr, mask_flat)
             cp_flat = cp_t[0].detach().cpu().numpy().astype(np.float32)
             shock_flat = shock_t[0].detach().cpu().numpy().astype(np.float32)
 
@@ -1015,7 +1129,7 @@ def infer_mesh_symbolic(
             feat_flat = ((feat_flat - expert_mean) / expert_scale).astype(np.float32)
             feat_tensor = torch.from_numpy(feat_flat[None, ...]).to(cfg.device, non_blocking=True)
             mask_flat = torch.ones((1, graph.n_points, 1), device=cfg.device, dtype=torch.float32)
-            cp_t, shock_t, _ = _forward_teacher(model, feat_tensor, edge_src, edge_dst, edge_attr, mask_flat)
+            cp_t, _, shock_t, _ = _forward_teacher(model, feat_tensor, edge_src, edge_dst, edge_attr, mask_flat)
             cp_flat = cp_t[0].detach().cpu().numpy().astype(np.float32)
             teacher_shock_flat = shock_t[0].detach().cpu().numpy().astype(np.float32)
             if str(artifact.get("type", "")) == "mesh_shock_line_symbolic":

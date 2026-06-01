@@ -166,8 +166,39 @@ def _gradient_loss(pred_grid: torch.Tensor, target_grid: torch.Tensor, weight_ma
     return 0.5 * ((loss_dx.flatten(1).sum(dim=1) / denom_dx).mean() + (loss_dy.flatten(1).sum(dim=1) / denom_dy).mean())
 
 
-def _normalized_gradient_map(field_grid: np.ndarray, mask: np.ndarray, quantile: float) -> np.ndarray:
-    grad_y, grad_x = np.gradient(field_grid.astype(np.float32), edge_order=1)
+def _normalized_gradient_map(
+    field_grid: np.ndarray,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    mask: np.ndarray,
+    quantile: float,
+) -> np.ndarray:
+    field = field_grid.astype(np.float32, copy=False)
+    valid_mask = mask.astype(bool, copy=False)
+    grad_x = np.zeros_like(field, dtype=np.float32)
+    grad_y = np.zeros_like(field, dtype=np.float32)
+
+    valid_x = valid_mask[:, 1:] & valid_mask[:, :-1]
+    valid_y = valid_mask[1:, :] & valid_mask[:-1, :]
+    dx = field[:, 1:] - field[:, :-1]
+    dy = field[1:, :] - field[:-1, :]
+    dist_x = np.sqrt(
+        (x_grid[:, 1:] - x_grid[:, :-1]) ** 2
+        + (y_grid[:, 1:] - y_grid[:, :-1]) ** 2
+    ).astype(np.float32)
+    dist_y = np.sqrt(
+        (x_grid[1:, :] - x_grid[:-1, :]) ** 2
+        + (y_grid[1:, :] - y_grid[:-1, :]) ** 2
+    ).astype(np.float32)
+    dx[~valid_x] = 0.0
+    dy[~valid_y] = 0.0
+    dist_x[~valid_x] = 1.0
+    dist_y[~valid_y] = 1.0
+    dx = dx / np.maximum(dist_x, 1e-3)
+    dy = dy / np.maximum(dist_y, 1e-3)
+    grad_x[:, :-1] = dx
+    grad_y[:-1, :] = dy
+
     grad_mag = np.sqrt(grad_x * grad_x + grad_y * grad_y) * mask
     valid = grad_mag[mask > 0.5]
     if valid.size == 0:
@@ -211,9 +242,17 @@ def _shock_line_target_from_score_map(
     return target.astype(np.float32) * mask
 
 
-def _shock_target_map_numpy(cp_grid: np.ndarray, cfx_grid: np.ndarray, mask: np.ndarray, quantile: float, cfx_weight: float) -> np.ndarray:
-    cp_map = _normalized_gradient_map(cp_grid, mask, quantile)
-    cfx_map = _normalized_gradient_map(cfx_grid, mask, quantile)
+def _shock_target_map_numpy(
+    cp_grid: np.ndarray,
+    cfx_grid: np.ndarray,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    mask: np.ndarray,
+    quantile: float,
+    cfx_weight: float,
+) -> np.ndarray:
+    cp_map = _normalized_gradient_map(cp_grid, x_grid, y_grid, mask, quantile)
+    cfx_map = _normalized_gradient_map(cfx_grid, x_grid, y_grid, mask, quantile)
     return np.clip(cp_map + float(cfx_weight) * cfx_map, 0.0, 1.0).astype(np.float32) * mask
 
 
@@ -222,9 +261,11 @@ def _build_shock_target_array(cfg: FullAircraftConfig, split: str, graph: Compac
     meta_path = _shock_target_meta_path(cfg, split)
     y_red = np.load(cfg.reduced_data_dir / f"Y_cut_{split}.npy", mmap_mode="r")
     expected_rows = int(y_red.shape[0])
-    expected_meta = {
+    expected_config = {
         "rows": expected_rows,
         "points_per_condition": int(graph.n_points),
+        "graph_connectivity": "projected_xy_offsets_plus_row_col_successors_v3",
+        "gradient_mode": "masked_projected_xy_distance_v4",
         "shock_quantile": float(cfg.mesh_teacher_shock_quantile),
         "cfx_weight": float(cfg.mesh_teacher_cfx_weight),
         "band_width": float(cfg.mesh_teacher_shock_band_width),
@@ -237,7 +278,8 @@ def _build_shock_target_array(cfg: FullAircraftConfig, split: str, graph: Compac
         if meta_path.exists():
             with meta_path.open("r", encoding="utf-8") as handle:
                 cached_meta = json.load(handle)
-        if int(cached.shape[0]) == expected_rows and cached_meta == expected_meta:
+        cached_config = cached_meta.get("config") if isinstance(cached_meta, dict) else None
+        if int(cached.shape[0]) == expected_rows and cached_config == expected_config:
             return cached
         target_path.unlink()
         if meta_path.exists():
@@ -245,6 +287,8 @@ def _build_shock_target_array(cfg: FullAircraftConfig, split: str, graph: Compac
 
     n_conditions = int(y_red.shape[0] // graph.n_points)
     alpha = np.zeros((y_red.shape[0], 1), dtype=np.float32)
+    x_grid = graph.scatter_numpy(graph.coords[:, [0]])[0]
+    y_grid = graph.scatter_numpy(graph.coords[:, [1]])[0]
     for cond_idx in range(n_conditions):
         row_start = cond_idx * graph.n_points
         row_stop = row_start + graph.n_points
@@ -253,11 +297,12 @@ def _build_shock_target_array(cfg: FullAircraftConfig, split: str, graph: Compac
         score_grid = _shock_target_map_numpy(
             cp_grid,
             cfx_grid,
+            x_grid,
+            y_grid,
             graph.valid_mask,
             cfg.mesh_teacher_shock_quantile,
             cfg.mesh_teacher_cfx_weight,
         )
-        x_grid = graph.scatter_numpy(graph.coords[:, [0]])[0]
         alpha_grid = _shock_line_target_from_score_map(
             score_grid,
             x_grid,
@@ -270,8 +315,16 @@ def _build_shock_target_array(cfg: FullAircraftConfig, split: str, graph: Compac
         if cond_idx == 0 or cond_idx + 1 == n_conditions or cond_idx % 25 == 0:
             print(f"[mesh-shock-target] {split}: condition {cond_idx + 1}/{n_conditions}")
     np.save(target_path, alpha.astype(np.float32))
+    valid = alpha[:, 0]
+    summary = {
+        "mean": float(np.mean(valid)),
+        "max": float(np.max(valid)),
+        "fraction_ge_025": float(np.mean(valid >= 0.25)),
+        "fraction_ge_050": float(np.mean(valid >= 0.50)),
+        "fraction_ge_075": float(np.mean(valid >= 0.75)),
+    }
     with meta_path.open("w", encoding="utf-8") as handle:
-        json.dump(expected_meta, handle, indent=2)
+        json.dump({"config": expected_config, "summary": summary}, handle, indent=2)
     return np.load(target_path, mmap_mode="r")
 
 
@@ -301,13 +354,15 @@ class _MeshConditionDataset(Dataset):
 
 
 def _save_model_config(cfg: FullAircraftConfig, graph: CompactSurfaceGraph, input_dim: int) -> None:
+    architecture = "mesh_teacher_cp_shock_residual_v4" if cfg.mesh_teacher_use_shock_residual else "mesh_teacher_cp_shock_v3"
     payload = {
-        "architecture": "mesh_teacher_cp_shock_v3",
+        "architecture": architecture,
         "input_dim": int(input_dim),
         "hidden_dim": int(cfg.mesh_teacher_hidden_dim),
         "latent_dim": int(cfg.latent_dim),
         "message_passing_steps": int(cfg.mesh_teacher_message_passing_steps),
         "dropout": float(cfg.mesh_teacher_dropout),
+        "use_shock_residual": bool(cfg.mesh_teacher_use_shock_residual),
         "points_per_condition": int(graph.n_points),
         "height": int(graph.height),
         "width": int(graph.width),
@@ -316,11 +371,14 @@ def _save_model_config(cfg: FullAircraftConfig, graph: CompactSurfaceGraph, inpu
         "shock_band_width": float(cfg.mesh_teacher_shock_band_width),
         "shock_presence_threshold": float(cfg.mesh_teacher_shock_presence_threshold),
         "shock_weight_power": float(cfg.mesh_teacher_shock_weight_power),
+        "cp_shock_weight": float(cfg.expert_shock_weight),
         "shock_focal_gamma": float(cfg.mesh_teacher_shock_focal_gamma),
         "shock_bce_weight": float(cfg.mesh_teacher_shock_bce_weight),
         "shock_dice_weight": float(cfg.mesh_teacher_shock_dice_weight),
         "x_dilations": [int(v) for v in cfg.mesh_graph_x_dilations],
         "include_diagonals": bool(cfg.mesh_graph_include_diagonals),
+        "graph_connectivity": "projected_xy_offsets_plus_row_col_successors_v3",
+        "edge_projection": "xy",
         "cp_loss_weight": float(cfg.mesh_teacher_cp_loss_weight),
         "shock_loss_weight": float(cfg.mesh_teacher_shock_loss_weight),
         "grad_loss_weight": float(cfg.mesh_teacher_grad_loss_weight),
@@ -679,7 +737,8 @@ def _teacher_loss(
     shock_target: torch.Tensor,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     mask_flat = torch.ones_like(cp)
-    cp_loss = _masked_weighted_smooth_l1(cp_pred, cp, mask_flat)
+    cp_weight = (1.0 + float(cfg.expert_shock_weight) * shock_target) * mask_flat
+    cp_loss = _masked_weighted_smooth_l1(cp_pred, cp, cp_weight)
     focal_loss = _masked_focal_bce_with_logits(
         shock_logits,
         shock_target,
@@ -722,6 +781,8 @@ def _evaluate_teacher(cfg: FullAircraftConfig, graph: CompactSurfaceGraph, model
     total_recall = 0.0
     total_iou = 0.0
     total_f1 = 0.0
+    total_shock_zone_cp = 0.0
+    total_smooth_zone_cp = 0.0
     n_batches = 0
     model.eval()
     with torch.no_grad():
@@ -734,6 +795,10 @@ def _evaluate_teacher(cfg: FullAircraftConfig, graph: CompactSurfaceGraph, model
             cp_mae = _masked_mae(cp_pred, cp, mask_flat)
             rmse = torch.sqrt(torch.mean((cp_pred - cp).square()))
             shock_mae = _masked_mae(shock_pred, shock_target, mask_flat)
+            shock_zone = (shock_target >= 0.50).to(dtype=cp.dtype)
+            smooth_zone = (shock_target < 0.25).to(dtype=cp.dtype)
+            shock_zone_cp = _masked_mae(cp_pred, cp, shock_zone) if torch.any(shock_zone > 0.5) else cp.new_tensor(0.0)
+            smooth_zone_cp = _masked_mae(cp_pred, cp, smooth_zone) if torch.any(smooth_zone > 0.5) else cp.new_tensor(0.0)
             binary = _binary_metrics(
                 shock_target.detach().cpu().numpy().reshape(-1),
                 shock_pred.detach().cpu().numpy().reshape(-1),
@@ -746,6 +811,8 @@ def _evaluate_teacher(cfg: FullAircraftConfig, graph: CompactSurfaceGraph, model
             total_recall += float(binary["recall"])
             total_iou += float(binary["iou"])
             total_f1 += float(binary["f1"])
+            total_shock_zone_cp += float(shock_zone_cp.item())
+            total_smooth_zone_cp += float(smooth_zone_cp.item())
             n_batches += 1
     denom = max(1, n_batches)
     return {
@@ -756,6 +823,8 @@ def _evaluate_teacher(cfg: FullAircraftConfig, graph: CompactSurfaceGraph, model
         "shock_recall": total_recall / denom,
         "shock_iou": total_iou / denom,
         "shock_f1": total_f1 / denom,
+        "cp_mae_shock_zone": total_shock_zone_cp / denom,
+        "cp_mae_smooth_zone": total_smooth_zone_cp / denom,
     }
 
 
@@ -801,6 +870,7 @@ def train_mesh_teacher(cfg: FullAircraftConfig) -> None:
         latent_dim=cfg.latent_dim,
         message_passing_steps=cfg.mesh_teacher_message_passing_steps,
         dropout=cfg.mesh_teacher_dropout,
+        use_shock_residual=cfg.mesh_teacher_use_shock_residual,
     ).to(cfg.device)
     edge_src, edge_dst, edge_attr = graph.edge_tensors(cfg.device)
     optimizer = optim.AdamW(model.parameters(), lr=cfg.mesh_teacher_lr, weight_decay=cfg.weight_decay)
@@ -855,7 +925,8 @@ def train_mesh_teacher(cfg: FullAircraftConfig) -> None:
     save_json(
         _training_metrics_path(cfg),
         {
-            "architecture": "mesh_teacher_cp_shock_v3",
+            "architecture": "mesh_teacher_cp_shock_residual_v4" if cfg.mesh_teacher_use_shock_residual else "mesh_teacher_cp_shock_v3",
+            "use_shock_residual": bool(cfg.mesh_teacher_use_shock_residual),
             "surface": cfg.reduced_surface,
             "final_train_objective": float(train_objective_hist[-1]),
             "final_test_cp_mae": float(test_mae_hist[-1]),
@@ -877,17 +948,20 @@ def train_mesh_teacher(cfg: FullAircraftConfig) -> None:
 def _load_mesh_teacher(cfg: FullAircraftConfig) -> FullAircraftMeshTeacher:
     config = json.loads(_model_config_path(cfg).read_text())
     architecture = str(config.get("architecture", "mesh_teacher_v1"))
-    if architecture != "mesh_teacher_cp_shock_v3":
+    supported = {"mesh_teacher_cp_shock_v3", "mesh_teacher_cp_shock_residual_v4"}
+    if architecture not in supported:
         raise ValueError(
             f"Stored mesh teacher architecture is {architecture!r}, but the current pipeline expects "
-            "'mesh_teacher_cp_shock_v3'. Re-run 'train-mesh-teacher' before distilling or inferring."
+            f"one of {sorted(supported)}. Re-run 'train-mesh-teacher' before distilling or inferring."
         )
+    use_shock_residual = bool(config.get("use_shock_residual", architecture == "mesh_teacher_cp_shock_residual_v4"))
     model = FullAircraftMeshTeacher(
         input_dim=int(config["input_dim"]),
         hidden_dim=int(config["hidden_dim"]),
         latent_dim=int(config.get("latent_dim", cfg.latent_dim)),
         message_passing_steps=int(config["message_passing_steps"]),
         dropout=float(config.get("dropout", cfg.mesh_teacher_dropout)),
+        use_shock_residual=use_shock_residual,
     )
     state = torch.load(_model_path(cfg), map_location="cpu")
     model.load_state_dict(state)
@@ -1155,3 +1229,208 @@ def infer_mesh_symbolic(
     )
     print(f"[infer-mesh-symbolic] Saved predictions to {output_path}")
     return output_path
+
+
+def _mach_regime(mach: float, cfg: FullAircraftConfig) -> str:
+    if mach < float(cfg.mach_sub_max):
+        return "subsonic"
+    if mach <= float(cfg.mach_trans_max):
+        return "transonic"
+    return "supersonic"
+
+
+def _condition_error_records(
+    cfg: FullAircraftConfig,
+    split: str,
+    graph: CompactSurfaceGraph,
+    prediction_path: Path,
+    shock_target: np.ndarray,
+) -> list[dict[str, float | int | str]]:
+    x_red = np.load(cfg.cut_data_dir / f"X_cut_{split}.npy", mmap_mode="r")
+    y_red = np.load(cfg.cut_data_dir / f"Y_cut_{split}.npy", mmap_mode="r")
+    pred_payload = np.load(prediction_path)
+    if "cp_pred" not in pred_payload:
+        raise KeyError(f"Prediction file does not contain 'cp_pred': {prediction_path}")
+    cp_pred = np.asarray(pred_payload["cp_pred"], dtype=np.float32)
+    if cp_pred.shape[0] != y_red.shape[0]:
+        raise ValueError(f"Prediction rows ({cp_pred.shape[0]}) do not match {split} target rows ({y_red.shape[0]}).")
+
+    n_conditions = int(y_red.shape[0] // graph.n_points)
+    records: list[dict[str, float | int | str]] = []
+    for cond_idx in range(n_conditions):
+        row_start = cond_idx * graph.n_points
+        row_stop = row_start + graph.n_points
+        truth = np.asarray(y_red[row_start:row_stop, [cfg.cp_column]], dtype=np.float32)
+        pred = np.asarray(cp_pred[row_start:row_stop], dtype=np.float32)
+        err = pred - truth
+        shock = np.asarray(shock_target[row_start:row_stop], dtype=np.float32).reshape(-1)
+        abs_err = np.abs(err).reshape(-1)
+        shock_zone = shock >= 0.50
+        smooth_zone = shock < 0.25
+        cond = np.asarray(x_red[row_start, : cfg.input_dim_raw], dtype=np.float32)
+        mae = float(np.mean(abs_err))
+        rmse = float(np.sqrt(np.mean(err * err)))
+        p95 = float(np.quantile(abs_err, 0.95))
+        records.append(
+            {
+                "condition_index": int(cond_idx),
+                "Mach": float(cond[6]),
+                "AoA_deg": float(cond[7]),
+                "Pi": float(cond[8]),
+                "regime": _mach_regime(float(cond[6]), cfg),
+                "mae": mae,
+                "rmse": rmse,
+                "abs_error_p95": p95,
+                "shock_fraction": float(np.mean(shock_zone)),
+                "shock_zone_mae": float(np.mean(abs_err[shock_zone])) if np.any(shock_zone) else 0.0,
+                "smooth_zone_mae": float(np.mean(abs_err[smooth_zone])) if np.any(smooth_zone) else 0.0,
+            }
+        )
+    return records
+
+
+def _aggregate_condition_records(records: list[dict[str, float | int | str]]) -> dict[str, object]:
+    if not records:
+        return {"conditions": 0}
+    maes = np.asarray([float(row["mae"]) for row in records], dtype=np.float64)
+    rmses = np.asarray([float(row["rmse"]) for row in records], dtype=np.float64)
+    shock_maes = np.asarray([float(row["shock_zone_mae"]) for row in records if float(row["shock_fraction"]) > 0.0], dtype=np.float64)
+    smooth_maes = np.asarray([float(row["smooth_zone_mae"]) for row in records], dtype=np.float64)
+    payload: dict[str, object] = {
+        "conditions": int(len(records)),
+        "mae_mean": float(np.mean(maes)),
+        "mae_median": float(np.median(maes)),
+        "mae_max": float(np.max(maes)),
+        "rmse_mean": float(np.mean(rmses)),
+        "shock_zone_mae_mean": float(np.mean(shock_maes)) if shock_maes.size else 0.0,
+        "smooth_zone_mae_mean": float(np.mean(smooth_maes)) if smooth_maes.size else 0.0,
+        "worst_conditions": sorted(records, key=lambda row: float(row["mae"]), reverse=True)[:10],
+        "by_regime": {},
+    }
+    by_regime: dict[str, list[dict[str, float | int | str]]] = {}
+    for row in records:
+        by_regime.setdefault(str(row["regime"]), []).append(row)
+    payload["by_regime"] = {
+        regime: {
+            "conditions": int(len(rows)),
+            "mae_mean": float(np.mean([float(row["mae"]) for row in rows])),
+            "mae_max": float(np.max([float(row["mae"]) for row in rows])),
+        }
+        for regime, rows in sorted(by_regime.items())
+    }
+    return payload
+
+
+def _graph_summary(graph: CompactSurfaceGraph) -> dict[str, object]:
+    degree = np.bincount(graph.edge_dst, minlength=graph.n_points).astype(np.float32)
+    valid_fraction = float(np.mean(graph.valid_mask > 0.5))
+    edge_distance = graph.edge_attr[:, 3] if graph.edge_attr.size else np.asarray([], dtype=np.float32)
+    return {
+        "height": int(graph.height),
+        "width": int(graph.width),
+        "points": int(graph.n_points),
+        "valid_fraction": valid_fraction,
+        "edges": int(graph.edge_src.shape[0]),
+        "degree_mean": float(np.mean(degree)) if degree.size else 0.0,
+        "degree_min": float(np.min(degree)) if degree.size else 0.0,
+        "degree_max": float(np.max(degree)) if degree.size else 0.0,
+        "edge_distance_mean": float(np.mean(edge_distance)) if edge_distance.size else 0.0,
+        "edge_distance_p95": float(np.quantile(edge_distance, 0.95)) if edge_distance.size else 0.0,
+    }
+
+
+def _plot_mesh_diagnostic_grid(
+    cfg: FullAircraftConfig,
+    split: str,
+    graph: CompactSurfaceGraph,
+    prediction_path: Path,
+    records: list[dict[str, float | int | str]],
+    max_conditions: int = 4,
+) -> Path:
+    y_red = np.load(cfg.cut_data_dir / f"Y_cut_{split}.npy", mmap_mode="r")
+    pred_payload = np.load(prediction_path)
+    cp_pred = np.asarray(pred_payload["cp_pred"], dtype=np.float32)
+    shock_target = np.asarray(_build_shock_target_array(cfg, split, graph), dtype=np.float32)
+    selected = sorted(records, key=lambda row: float(row["mae"]), reverse=True)[:max_conditions]
+    if not selected:
+        raise ValueError("No condition records available for mesh diagnostic plot.")
+
+    fig, axes = plt.subplots(len(selected), 4, figsize=(15.5, 3.2 * len(selected)), constrained_layout=True)
+    if len(selected) == 1:
+        axes = axes[None, :]
+    mask = graph.valid_mask <= 0.5
+    columns = ["truth Cp", "pred Cp", "|error|", "shock target"]
+    for row_idx_plot, record in enumerate(selected):
+        cond_idx = int(record["condition_index"])
+        row_start = cond_idx * graph.n_points
+        row_stop = row_start + graph.n_points
+        truth_grid = graph.scatter_numpy(np.asarray(y_red[row_start:row_stop, [cfg.cp_column]], dtype=np.float32))[0]
+        pred_grid = graph.scatter_numpy(np.asarray(cp_pred[row_start:row_stop], dtype=np.float32))[0]
+        err_grid = np.abs(pred_grid - truth_grid)
+        shock_grid = graph.scatter_numpy(np.asarray(shock_target[row_start:row_stop], dtype=np.float32))[0]
+        grids = [truth_grid, pred_grid, err_grid, shock_grid]
+        cmaps = ["jet", "jet", "magma", "viridis"]
+        for col_idx_plot, (grid, cmap) in enumerate(zip(grids, cmaps)):
+            ax = axes[row_idx_plot, col_idx_plot]
+            data = np.ma.masked_where(mask, grid)
+            image = ax.imshow(data, origin="lower", aspect="auto", cmap=cmap)
+            if row_idx_plot == 0:
+                ax.set_title(columns[col_idx_plot])
+            if col_idx_plot == 0:
+                ax.set_ylabel(
+                    f"cond {cond_idx}\nM={float(record['Mach']):.2f}, "
+                    f"AoA={float(record['AoA_deg']):.1f}\nMAE={float(record['mae']):.3f}"
+                )
+            ax.set_xticks([])
+            ax.set_yticks([])
+            fig.colorbar(image, ax=ax, shrink=0.82)
+
+    out_path = cfg.results_surface_dir(cfg.reduced_surface) / f"mesh_diagnostics_{split}_worst.png"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def diagnose_mesh_pipeline(
+    cfg: FullAircraftConfig,
+    split: str = "test",
+    prediction_path: Path | None = None,
+) -> dict[str, object]:
+    cfg.ensure_dirs()
+    graph = CompactSurfaceGraph.from_reference(cfg)
+    prediction_path = (
+        Path(prediction_path).expanduser().resolve()
+        if prediction_path is not None
+        else cfg.inference_dir / f"X_cut_{split}_mesh_teacher.npz"
+    )
+    if not prediction_path.exists():
+        fallback = cfg.inference_dir / f"X_cut_{split}_mesh_symbolic.npz"
+        if fallback.exists():
+            prediction_path = fallback
+        else:
+            raise FileNotFoundError(f"No mesh prediction file found: {prediction_path} or {fallback}. Run infer-mesh-teacher first.")
+
+    target = np.asarray(_build_shock_target_array(cfg, split, graph), dtype=np.float32).reshape(-1)
+    records = _condition_error_records(cfg, split, graph, prediction_path, target)
+    plot_path = _plot_mesh_diagnostic_grid(cfg, split, graph, prediction_path, records)
+    payload: dict[str, object] = {
+        "surface": cfg.reduced_surface,
+        "split": split,
+        "prediction_path": str(prediction_path),
+        "diagnostic_plot": str(plot_path),
+        "graph": _graph_summary(graph),
+        "shock_target": {
+            "mean": float(np.mean(target)),
+            "max": float(np.max(target)),
+            "fraction_ge_025": float(np.mean(target >= 0.25)),
+            "fraction_ge_050": float(np.mean(target >= 0.50)),
+            "fraction_ge_075": float(np.mean(target >= 0.75)),
+        },
+        "error_summary": _aggregate_condition_records(records),
+        "conditions": records,
+    }
+    out_path = cfg.metrics_dir / f"mesh_pipeline_diagnostics_{split}.json"
+    save_json(out_path, payload)
+    print(f"[diagnose-mesh] Saved diagnostics to {out_path}")
+    return payload

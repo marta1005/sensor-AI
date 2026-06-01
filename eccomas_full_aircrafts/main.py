@@ -80,6 +80,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Distill the MeshGraphNet auxiliary shock head into a symbolic shock-line sensor",
     )
 
+    mesh_diag_parser = subparsers.add_parser(
+        "diagnose-mesh",
+        parents=[common],
+        help="Summarize mesh graph, shock target, and per-condition Cp errors",
+    )
+    mesh_diag_parser.add_argument("--split", type=str, choices=["train", "test"], default="test")
+    mesh_diag_parser.add_argument("--prediction-path", type=str, default=None)
+
     shock_infer_parser = subparsers.add_parser(
         "infer-shock-symbolic",
         parents=[common],
@@ -235,6 +243,11 @@ def main() -> None:
         from eccomas_full_aircrafts.pipeline.mesh_teacher_pipeline import distill_mesh_sensor
 
         distill_mesh_sensor(cfg)
+    elif args.command == "diagnose-mesh":
+        from eccomas_full_aircrafts.pipeline.mesh_teacher_pipeline import diagnose_mesh_pipeline
+
+        prediction_path = Path(args.prediction_path).expanduser().resolve() if args.prediction_path else None
+        diagnose_mesh_pipeline(cfg, split=args.split, prediction_path=prediction_path)
     elif args.command == "infer-shock-symbolic":
         from eccomas_full_aircrafts.pipeline.shock_local_pipeline import infer_shock_symbolic
 

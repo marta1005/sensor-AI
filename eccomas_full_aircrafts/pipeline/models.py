@@ -293,7 +293,7 @@ class _MeshMessagePassingLayer(nn.Module):
 
 
 class FullAircraftMeshTeacher(nn.Module):
-    """Graph teacher with a local latent bottleneck, direct Cp head, and auxiliary shock head."""
+    """Graph teacher with a local latent bottleneck and optional shock-gated Cp residual."""
 
     def __init__(
         self,
@@ -303,8 +303,10 @@ class FullAircraftMeshTeacher(nn.Module):
         edge_dim: int = 6,
         message_passing_steps: int = 6,
         dropout: float = 0.05,
+        use_shock_residual: bool = False,
     ):
         super().__init__()
+        self.use_shock_residual = bool(use_shock_residual)
         self.node_encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -325,7 +327,7 @@ class FullAircraftMeshTeacher(nn.Module):
         self.cp_head = nn.Sequential(
             nn.Linear(head_input_dim, hidden_dim // 2),
             nn.SiLU(),
-            nn.Linear(hidden_dim // 2, 1),
+            nn.Linear(hidden_dim // 2, 2 if self.use_shock_residual else 1),
         )
         self.shock_head = nn.Sequential(
             nn.Linear(head_input_dim, hidden_dim // 2),
@@ -345,8 +347,14 @@ class FullAircraftMeshTeacher(nn.Module):
             hidden = layer(hidden, edge_src=edge_src, edge_dst=edge_dst, edge_attr=edge_attr)
         latent = self.to_latent(hidden)
         head_input = torch.cat([hidden, latent], dim=-1)
-        cp = self.cp_head(head_input)
         shock_logits = self.shock_head(head_input)
+        cp_raw = self.cp_head(head_input)
+        if self.use_shock_residual:
+            cp_base = cp_raw[..., 0:1]
+            cp_residual = cp_raw[..., 1:2]
+            cp = cp_base + torch.sigmoid(shock_logits) * cp_residual
+        else:
+            cp = cp_raw
         return cp, shock_logits, latent
 
 

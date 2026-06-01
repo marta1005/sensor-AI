@@ -115,6 +115,7 @@ class FullAircraftConfig:
     mesh_teacher_hidden_dim: int = 96
     mesh_teacher_message_passing_steps: int = 6
     mesh_teacher_dropout: float = 0.05
+    mesh_teacher_use_shock_residual: bool = True
     mesh_teacher_lr: float = 1e-3
     mesh_teacher_epochs: int = 80
     mesh_teacher_batch_size: int = 2

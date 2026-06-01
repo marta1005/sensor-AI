@@ -64,27 +64,53 @@ class CompactSurfaceGraph:
         edge_src: list[int] = []
         edge_dst: list[int] = []
         edge_attr: list[list[float]] = []
-        for src_idx, (r, c) in enumerate(zip(row_idx.tolist(), col_idx.tolist())):
+        edge_keys: set[tuple[int, int]] = set()
+
+        def _add_edge(src_idx: int, dst_idx: int, dr: int, dc: int) -> None:
+            if src_idx == dst_idx or (src_idx, dst_idx) in edge_keys:
+                return
+            edge_keys.add((src_idx, dst_idx))
             src_xyz = coords[src_idx]
+            dst_xyz = coords[dst_idx]
+            delta = dst_xyz - src_xyz
+            delta_xy = delta[:2]
+            distance = float(np.linalg.norm(delta_xy))
+            edge_src.append(src_idx)
+            edge_dst.append(dst_idx)
+            edge_attr.append(
+                [
+                    float(delta[0]),
+                    float(delta[1]),
+                    0.0,
+                    distance,
+                    float(dr),
+                    float(dc),
+                ]
+            )
+
+        rows = row_idx.tolist()
+        cols = col_idx.tolist()
+        for src_idx, (r, c) in enumerate(zip(rows, cols)):
             for dr, dc in offsets:
                 dst_idx = lookup.get((int(r + dr), int(c + dc)))
-                if dst_idx is None:
-                    continue
-                dst_xyz = coords[dst_idx]
-                delta = dst_xyz - src_xyz
-                distance = float(np.linalg.norm(delta))
-                edge_src.append(src_idx)
-                edge_dst.append(dst_idx)
-                edge_attr.append(
-                    [
-                        float(delta[0]),
-                        float(delta[1]),
-                        float(delta[2]),
-                        distance,
-                        float(dr),
-                        float(dc),
-                    ]
-                )
+                if dst_idx is not None:
+                    _add_edge(src_idx, dst_idx, int(dr), int(dc))
+
+        for row in np.unique(row_idx):
+            row_points = np.flatnonzero(row_idx == row)
+            ordered = row_points[np.argsort(col_idx[row_points])]
+            for left, right in zip(ordered[:-1], ordered[1:]):
+                dc = int(col_idx[right] - col_idx[left])
+                _add_edge(int(left), int(right), 0, dc)
+                _add_edge(int(right), int(left), 0, -dc)
+
+        for col in np.unique(col_idx):
+            col_points = np.flatnonzero(col_idx == col)
+            ordered = col_points[np.argsort(row_idx[col_points])]
+            for lower, upper in zip(ordered[:-1], ordered[1:]):
+                dr = int(row_idx[upper] - row_idx[lower])
+                _add_edge(int(lower), int(upper), dr, 0)
+                _add_edge(int(upper), int(lower), -dr, 0)
 
         return cls(
             height=height,

@@ -18,6 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--project-root", type=str, default=None, help="Base project root. Used only as default for derived paths.")
     common.add_argument("--raw-data-dir", type=str, default=None, help="Folder containing the full ONERA arrays.")
     common.add_argument("--pipeline-root", type=str, default=None, help="Folder where full-aircraft outputs will be written.")
+    common.add_argument("--device", type=str, choices=["auto", "cuda", "cpu"], default=None, help="Optional torch device override.")
     common.add_argument(
         "--reduced-surface",
         type=str,
@@ -185,6 +186,7 @@ def _build_cfg(args: argparse.Namespace, surface: str | None = None) -> FullAirc
         raw_data_dir=Path(args.raw_data_dir) if getattr(args, "raw_data_dir", None) else None,
         pipeline_root=Path(args.pipeline_root) if getattr(args, "pipeline_root", None) else None,
         reduced_surface=surface or getattr(args, "reduced_surface", "upper"),
+        device_override=getattr(args, "device", None),
     )
 
 

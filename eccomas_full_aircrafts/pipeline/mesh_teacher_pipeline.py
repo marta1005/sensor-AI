@@ -965,7 +965,15 @@ def _load_mesh_teacher(cfg: FullAircraftConfig) -> FullAircraftMeshTeacher:
     )
     state = torch.load(_model_path(cfg), map_location="cpu")
     model.load_state_dict(state)
-    model.to(cfg.device)
+    try:
+        model.to(cfg.device)
+    except RuntimeError as exc:
+        if "out of memory" in str(exc).lower() and str(cfg.device).startswith("cuda"):
+            raise RuntimeError(
+                "CUDA ran out of memory while loading the mesh teacher. "
+                "Free GPU memory, select another GPU with CUDA_VISIBLE_DEVICES, or rerun with '--device cpu'."
+            ) from exc
+        raise
     model.eval()
     return model
 

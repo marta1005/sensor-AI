@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -28,6 +29,7 @@ class FullAircraftConfig:
     sensor_dir: Optional[Path] = None
     symbolic_dir: Optional[Path] = None
     diffusion_dir: Optional[Path] = None
+    device_override: Optional[str] = None
 
     raw_points_per_condition: int = 260_774
     input_dim_raw: int = 9
@@ -214,6 +216,15 @@ class FullAircraftConfig:
     def device(self):
         if torch is None:
             raise ImportError("torch is required for training commands.")
+        requested = (self.device_override or os.environ.get("ECCOMAS_DEVICE") or "auto").strip().lower()
+        if requested == "cpu":
+            return torch.device("cpu")
+        if requested == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA was requested but is not available.")
+            return torch.device("cuda")
+        if requested != "auto":
+            raise ValueError(f"Unsupported device override {requested!r}. Use 'auto', 'cuda', or 'cpu'.")
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def surface_reference_path(self, surface: str | None = None) -> Path:

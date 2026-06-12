@@ -126,13 +126,6 @@ class FullAircraftConfig:
     mesh_teacher_cp_loss_weight: float = 1.0
     mesh_teacher_shock_loss_weight: float = 0.35
     mesh_teacher_grad_loss_weight: float = 0.20
-    mesh_teacher_condition_weight_aoa_start: float = 8.0
-    mesh_teacher_condition_weight_aoa_full: float = 12.5
-    mesh_teacher_condition_weight_aoa_gain: float = 1.0
-    mesh_teacher_condition_weight_transonic_center: float = 0.85
-    mesh_teacher_condition_weight_transonic_width: float = 0.08
-    mesh_teacher_condition_weight_transonic_gain: float = 0.35
-    mesh_teacher_condition_weight_cap: float = 2.0
     mesh_teacher_cfx_weight: float = 0.30
     mesh_teacher_shock_band_width: float = 0.45
     mesh_teacher_shock_presence_threshold: float = 0.20

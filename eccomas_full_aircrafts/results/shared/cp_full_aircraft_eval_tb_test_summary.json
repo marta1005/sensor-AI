@@ -1,0 +1,17 @@
+{
+  "n_conditions": 1,
+  "results": [
+    {
+      "AoA_deg": 9.0,
+      "Mach": 0.8399999737739563,
+      "Pi": 2.0,
+      "condition_index": 79,
+      "cp_max": 1.8072965145111084,
+      "cp_min": -1.5775306224822998,
+      "path": "/Users/martaarnabatmartin/Desktop/eccomas/eccomas_full_aircrafts/results/shared/cp_full_aircraft_eval_tb_test_cond79.png",
+      "points_plotted": 120000,
+      "split": "test"
+    }
+  ],
+  "split": "test"
+}

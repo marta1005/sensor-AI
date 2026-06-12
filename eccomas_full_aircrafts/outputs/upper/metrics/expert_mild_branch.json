@@ -1,0 +1,16 @@
+{
+  "regime": "mild_branch",
+  "partition_mode": "hybrid",
+  "model_architecture": "unet2d_compact_v1",
+  "train_conditions": 65,
+  "train_rows": 2859935,
+  "train_weight_sum": 65.0,
+  "test_conditions": 46,
+  "test_rows": 2023954,
+  "final_train_smooth_l1": 0.011149675485033256,
+  "final_train_objective": 0.018269055537306345,
+  "final_test_smooth_l1": 0.011924478772055843,
+  "expert_shock_weight": 2.0,
+  "expert_shock_quantile": 0.95,
+  "expert_gradient_loss_weight": 0.2
+}

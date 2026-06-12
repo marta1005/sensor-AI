@@ -1,0 +1,13 @@
+{
+  "regime": "transonic",
+  "model_architecture": "unet2d_compact_v1",
+  "train_conditions": 216,
+  "train_rows": 9503784,
+  "train_weight_sum": 183.60003662109375,
+  "test_conditions": 72,
+  "test_rows": 3167928,
+  "final_train_smooth_l1": 0.01597419041113398,
+  "final_test_smooth_l1": 0.01770532148010615,
+  "overlap_margin": 0.05,
+  "overlap_min_weight": 0.25
+}

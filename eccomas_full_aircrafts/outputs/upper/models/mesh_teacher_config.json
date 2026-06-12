@@ -1,0 +1,32 @@
+{
+  "architecture": "mesh_teacher_cp_shock_residual_v4",
+  "input_dim": 19,
+  "hidden_dim": 96,
+  "latent_dim": 4,
+  "message_passing_steps": 6,
+  "dropout": 0.05,
+  "use_shock_residual": true,
+  "points_per_condition": 54294,
+  "height": 426,
+  "width": 1093,
+  "shock_quantile": 0.95,
+  "cfx_weight": 0.3,
+  "shock_band_width": 0.45,
+  "shock_presence_threshold": 0.2,
+  "shock_weight_power": 2.0,
+  "cp_shock_weight": 2.0,
+  "shock_focal_gamma": 2.0,
+  "shock_bce_weight": 0.75,
+  "shock_dice_weight": 0.25,
+  "x_dilations": [
+    1,
+    2,
+    4
+  ],
+  "include_diagonals": true,
+  "graph_connectivity": "projected_xy_offsets_plus_row_col_successors_v3",
+  "edge_projection": "xy",
+  "cp_loss_weight": 1.0,
+  "shock_loss_weight": 0.35,
+  "grad_loss_weight": 0.2
+}

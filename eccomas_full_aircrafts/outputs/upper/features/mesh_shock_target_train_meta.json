@@ -1,0 +1,9 @@
+{
+  "rows": 16939728,
+  "points_per_condition": 54294,
+  "shock_quantile": 0.95,
+  "cfx_weight": 0.3,
+  "band_width": 0.45,
+  "presence_threshold": 0.2,
+  "weight_power": 2.0
+}

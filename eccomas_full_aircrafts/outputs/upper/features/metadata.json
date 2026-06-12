@@ -1,0 +1,62 @@
+{
+  "cluster_algorithm": "kmeans",
+  "cluster_count": 3,
+  "encoder_feature_names": [
+    "x",
+    "y",
+    "z",
+    "nx",
+    "ny",
+    "nz",
+    "Mach",
+    "Pi",
+    "AoA_deg",
+    "sin_AoA",
+    "cos_AoA",
+    "Mach_sq",
+    "radius_yz",
+    "Mach_Pi",
+    "Mach_sin_AoA",
+    "Mach_cos_AoA",
+    "x_Mach",
+    "y_Mach",
+    "z_Mach",
+    "Mach_nx",
+    "Mach_ny",
+    "Mach_nz"
+  ],
+  "expert_feature_names": [
+    "x",
+    "y",
+    "z",
+    "nx",
+    "ny",
+    "nz",
+    "Mach",
+    "AoA_deg",
+    "Pi",
+    "sin_AoA",
+    "cos_AoA",
+    "Mach_sq",
+    "radius_yz",
+    "x_Mach",
+    "y_Mach",
+    "z_Mach",
+    "Mach_nx",
+    "Mach_ny",
+    "Mach_nz"
+  ],
+  "expert_partition_mode": "hybrid",
+  "hybrid_source_clusters": 5,
+  "reduced_surface": "upper",
+  "test": {
+    "expert_dim": 19,
+    "gate_dim": 22,
+    "rows": 8469864
+  },
+  "train": {
+    "expert_dim": 19,
+    "gate_dim": 22,
+    "rows": 16939728
+  }
+}

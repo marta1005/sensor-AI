@@ -1,0 +1,36 @@
+{
+  "cluster_algorithm": "kmeans",
+  "cluster_count": 3,
+  "davies_bouldin_train": 1.1038070493886007,
+  "feature_names": [
+    "Mach",
+    "AoA_deg",
+    "Pi",
+    "cp_min",
+    "cp_mean",
+    "cp_std",
+    "negative_cp_fraction",
+    "strong_suction_fraction",
+    "grad_mean",
+    "grad_p95",
+    "grad_max",
+    "shock_x_weighted",
+    "shock_y_weighted",
+    "shock_span_std",
+    "front_cp_mean",
+    "rear_cp_mean"
+  ],
+  "partition_mode": "cluster",
+  "silhouette_train": 0.3112117810868094,
+  "surface": "upper",
+  "test_cluster_counts": {
+    "0": 51,
+    "1": 45,
+    "2": 60
+  },
+  "train_cluster_counts": {
+    "0": 71,
+    "1": 125,
+    "2": 116
+  }
+}

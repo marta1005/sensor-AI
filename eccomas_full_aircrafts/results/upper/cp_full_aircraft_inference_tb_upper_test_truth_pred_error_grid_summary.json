@@ -1,0 +1,55 @@
+{
+  "condition_indices": [
+    2,
+    39,
+    65,
+    79
+  ],
+  "path": "/Users/martaarnabatmartin/Desktop/eccomas/eccomas_full_aircrafts/results/upper/cp_full_aircraft_inference_tb_upper_test_truth_pred_error_grid_2_39_65_79.png",
+  "prediction_path": "/Users/martaarnabatmartin/Desktop/eccomas/eccomas_full_aircrafts/outputs/upper/inference/X_cut_test_mesh_teacher.npz",
+  "results": [
+    {
+      "AoA_deg": 5.0,
+      "Mach": 0.30000001192092896,
+      "Pi": 1.0,
+      "condition_index": 2,
+      "mae": 0.013939468190073967,
+      "rmse": 0.039022114127874374,
+      "split": "test",
+      "surface": "upper"
+    },
+    {
+      "AoA_deg": 8.0,
+      "Mach": 0.8799999952316284,
+      "Pi": 1.0,
+      "condition_index": 39,
+      "mae": 0.07433692365884781,
+      "rmse": 0.15140801668167114,
+      "split": "test",
+      "surface": "upper"
+    },
+    {
+      "AoA_deg": 0.0,
+      "Mach": 0.75,
+      "Pi": 2.0,
+      "condition_index": 65,
+      "mae": 0.005648398771882057,
+      "rmse": 0.00826518889516592,
+      "split": "test",
+      "surface": "upper"
+    },
+    {
+      "AoA_deg": 9.0,
+      "Mach": 0.8399999737739563,
+      "Pi": 2.0,
+      "condition_index": 79,
+      "mae": 0.02573804184794426,
+      "rmse": 0.06040507182478905,
+      "split": "test",
+      "surface": "upper"
+    }
+  ],
+  "split": "test",
+  "surface": "upper",
+  "view": "top"
+}

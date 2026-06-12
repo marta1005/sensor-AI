@@ -1,0 +1,42 @@
+{
+  "lower": {
+    "path": "/Users/martaarnabatmartin/Desktop/eccomas/eccomas_full_aircrafts/outputs/surfaces/lower_surface_reference.npz",
+    "rows": 54294,
+    "surface": "lower",
+    "x_range": [
+      2.3784353733062744,
+      65.05724334716797
+    ],
+    "y_range": [
+      0.0032766475342214108,
+      29.4129695892334
+    ],
+    "z_range": [
+      -0.06582693010568619,
+      8.715313911437988
+    ]
+  },
+  "preview_path": "/Users/martaarnabatmartin/Desktop/eccomas/eccomas_full_aircrafts/results/shared/reference_surface_preview.png",
+  "raw_points_per_condition": 260774,
+  "reference_condition_index": 0,
+  "reference_split": "train",
+  "upper": {
+    "path": "/Users/martaarnabatmartin/Desktop/eccomas/eccomas_full_aircrafts/outputs/surfaces/upper_surface_reference.npz",
+    "rows": 54294,
+    "surface": "upper",
+    "x_range": [
+      2.3854846954345703,
+      65.05587005615234
+    ],
+    "y_range": [
+      0.0035414977464824915,
+      29.4069881439209
+    ],
+    "z_range": [
+      -0.05281532183289528,
+      8.715313911437988
+    ]
+  },
+  "x_bins": 1440,
+  "y_bins": 600
+}

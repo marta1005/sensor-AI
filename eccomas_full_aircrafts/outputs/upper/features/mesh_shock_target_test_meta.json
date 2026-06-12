@@ -1,0 +1,20 @@
+{
+  "config": {
+    "rows": 8469864,
+    "points_per_condition": 54294,
+    "graph_connectivity": "projected_xy_offsets_plus_row_col_successors_v3",
+    "gradient_mode": "masked_projected_xy_distance_v4",
+    "shock_quantile": 0.95,
+    "cfx_weight": 0.3,
+    "band_width": 0.45,
+    "presence_threshold": 0.2,
+    "weight_power": 2.0
+  },
+  "summary": {
+    "mean": 0.10869114845991135,
+    "max": 1.0,
+    "fraction_ge_025": 0.1492866945679411,
+    "fraction_ge_050": 0.10406129307389116,
+    "fraction_ge_075": 0.06457506283453902
+  }
+}

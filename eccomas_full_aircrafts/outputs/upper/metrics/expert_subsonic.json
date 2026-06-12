@@ -1,0 +1,13 @@
+{
+  "regime": "subsonic",
+  "model_architecture": "unet2d_compact_v1",
+  "train_conditions": 72,
+  "train_rows": 3167928,
+  "train_weight_sum": 54.0,
+  "test_conditions": 24,
+  "test_rows": 1055976,
+  "final_train_smooth_l1": 0.04255963857192774,
+  "final_test_smooth_l1": 0.03776054883686205,
+  "overlap_margin": 0.05,
+  "overlap_min_weight": 0.25
+}

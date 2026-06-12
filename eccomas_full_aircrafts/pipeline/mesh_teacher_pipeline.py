@@ -114,10 +114,23 @@ def _finite_diff_y(field: torch.Tensor) -> torch.Tensor:
     return F.pad(field[..., 1:, :] - field[..., :-1, :], (0, 0, 0, 1))
 
 
-def _masked_weighted_smooth_l1(pred: torch.Tensor, target: torch.Tensor, weight_map: torch.Tensor) -> torch.Tensor:
+def _sample_weighted_mean(per_sample: torch.Tensor, sample_weight: torch.Tensor | None = None) -> torch.Tensor:
+    if sample_weight is None:
+        return per_sample.mean()
+    weights = sample_weight.reshape(-1).to(device=per_sample.device, dtype=per_sample.dtype)
+    return (per_sample * weights).sum() / weights.sum().clamp_min(1e-6)
+
+
+def _masked_weighted_smooth_l1(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    weight_map: torch.Tensor,
+    sample_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
     loss = F.smooth_l1_loss(pred, target, reduction="none") * weight_map
     denom = weight_map.flatten(1).sum(dim=1).clamp_min(1.0)
-    return (loss.flatten(1).sum(dim=1) / denom).mean()
+    per_sample = loss.flatten(1).sum(dim=1) / denom
+    return _sample_weighted_mean(per_sample, sample_weight)
 
 
 def _masked_mae(pred: torch.Tensor, target: torch.Tensor, weight_map: torch.Tensor) -> torch.Tensor:
@@ -131,26 +144,36 @@ def _masked_focal_bce_with_logits(
     target: torch.Tensor,
     weight_map: torch.Tensor,
     gamma: float,
+    sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
     prob = torch.sigmoid(logits)
     pt = target * prob + (1.0 - target) * (1.0 - prob)
     focal = ((1.0 - pt).clamp_min(1e-6) ** float(gamma)) * bce * weight_map
     denom = weight_map.flatten(1).sum(dim=1).clamp_min(1.0)
-    return (focal.flatten(1).sum(dim=1) / denom).mean()
+    per_sample = focal.flatten(1).sum(dim=1) / denom
+    return _sample_weighted_mean(per_sample, sample_weight)
 
 
 def _masked_soft_dice_loss(
     prob: torch.Tensor,
     target: torch.Tensor,
     weight_map: torch.Tensor,
+    sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     numer = 2.0 * (prob * target * weight_map).flatten(1).sum(dim=1) + 1e-6
     denom = ((prob + target) * weight_map).flatten(1).sum(dim=1) + 1e-6
-    return (1.0 - numer / denom).mean()
+    per_sample = 1.0 - numer / denom
+    return _sample_weighted_mean(per_sample, sample_weight)
 
 
-def _gradient_loss(pred_grid: torch.Tensor, target_grid: torch.Tensor, weight_map: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def _gradient_loss(
+    pred_grid: torch.Tensor,
+    target_grid: torch.Tensor,
+    weight_map: torch.Tensor,
+    mask: torch.Tensor,
+    sample_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
     pred_dx = _finite_diff_x(pred_grid)
     pred_dy = _finite_diff_y(pred_grid)
     target_dx = _finite_diff_x(target_grid)
@@ -163,7 +186,9 @@ def _gradient_loss(pred_grid: torch.Tensor, target_grid: torch.Tensor, weight_ma
     loss_dy = F.smooth_l1_loss(pred_dy, target_dy, reduction="none") * weight_dy
     denom_dx = weight_dx.flatten(1).sum(dim=1).clamp_min(1.0)
     denom_dy = weight_dy.flatten(1).sum(dim=1).clamp_min(1.0)
-    return 0.5 * ((loss_dx.flatten(1).sum(dim=1) / denom_dx).mean() + (loss_dy.flatten(1).sum(dim=1) / denom_dy).mean())
+    per_sample_dx = loss_dx.flatten(1).sum(dim=1) / denom_dx
+    per_sample_dy = loss_dy.flatten(1).sum(dim=1) / denom_dy
+    return 0.5 * (_sample_weighted_mean(per_sample_dx, sample_weight) + _sample_weighted_mean(per_sample_dy, sample_weight))
 
 
 def _normalized_gradient_map(
@@ -328,14 +353,39 @@ def _build_shock_target_array(cfg: FullAircraftConfig, split: str, graph: Compac
     return np.load(target_path, mmap_mode="r")
 
 
+def _condition_difficulty_weight(condition_raw: np.ndarray, cfg: FullAircraftConfig) -> float:
+    mach = float(condition_raw[6])
+    aoa = abs(float(condition_raw[7]))
+    aoa_span = max(float(cfg.mesh_teacher_condition_weight_aoa_full - cfg.mesh_teacher_condition_weight_aoa_start), 1e-6)
+    aoa_factor = np.clip((aoa - float(cfg.mesh_teacher_condition_weight_aoa_start)) / aoa_span, 0.0, 1.0)
+    transonic_offset = (mach - float(cfg.mesh_teacher_condition_weight_transonic_center)) / max(
+        float(cfg.mesh_teacher_condition_weight_transonic_width),
+        1e-6,
+    )
+    transonic_factor = float(np.exp(-0.5 * transonic_offset * transonic_offset))
+    weight = (
+        1.0
+        + float(cfg.mesh_teacher_condition_weight_aoa_gain) * float(aoa_factor)
+        + float(cfg.mesh_teacher_condition_weight_transonic_gain) * transonic_factor
+    )
+    return float(np.clip(weight, 1.0, float(cfg.mesh_teacher_condition_weight_cap)))
+
+
 class _MeshConditionDataset(Dataset):
     def __init__(self, cfg: FullAircraftConfig, split: str, graph: CompactSurfaceGraph):
         self.features = np.load(cfg.features_dir / f"expert_features_{split}.npy", mmap_mode="r")
         self.cp = np.load(cfg.features_dir / f"cp_{split}.npy", mmap_mode="r")
         self.shock_target = _build_shock_target_array(cfg, split, graph)
+        self.x_raw = np.load(cfg.reduced_data_dir / f"X_cut_{split}.npy", mmap_mode="r")
+        self.cfg = cfg
         self.graph = graph
         self.points_per_condition = graph.n_points
         self.n_conditions = int(self.features.shape[0] // self.points_per_condition)
+        self.condition_weights = np.zeros((self.n_conditions,), dtype=np.float32)
+        for cond_idx in range(self.n_conditions):
+            row_start = cond_idx * self.points_per_condition
+            condition_raw = np.asarray(self.x_raw[row_start, : cfg.input_dim_raw], dtype=np.float32)
+            self.condition_weights[cond_idx] = _condition_difficulty_weight(condition_raw, cfg)
 
     def __len__(self) -> int:
         return self.n_conditions
@@ -350,6 +400,7 @@ class _MeshConditionDataset(Dataset):
             torch.from_numpy(feat_flat),
             torch.from_numpy(cp_flat),
             torch.from_numpy(shock_flat),
+            torch.tensor([self.condition_weights[idx]], dtype=torch.float32),
         )
 
 
@@ -372,6 +423,13 @@ def _save_model_config(cfg: FullAircraftConfig, graph: CompactSurfaceGraph, inpu
         "shock_presence_threshold": float(cfg.mesh_teacher_shock_presence_threshold),
         "shock_weight_power": float(cfg.mesh_teacher_shock_weight_power),
         "cp_shock_weight": float(cfg.expert_shock_weight),
+        "condition_weight_aoa_start": float(cfg.mesh_teacher_condition_weight_aoa_start),
+        "condition_weight_aoa_full": float(cfg.mesh_teacher_condition_weight_aoa_full),
+        "condition_weight_aoa_gain": float(cfg.mesh_teacher_condition_weight_aoa_gain),
+        "condition_weight_transonic_center": float(cfg.mesh_teacher_condition_weight_transonic_center),
+        "condition_weight_transonic_width": float(cfg.mesh_teacher_condition_weight_transonic_width),
+        "condition_weight_transonic_gain": float(cfg.mesh_teacher_condition_weight_transonic_gain),
+        "condition_weight_cap": float(cfg.mesh_teacher_condition_weight_cap),
         "shock_focal_gamma": float(cfg.mesh_teacher_shock_focal_gamma),
         "shock_bce_weight": float(cfg.mesh_teacher_shock_bce_weight),
         "shock_dice_weight": float(cfg.mesh_teacher_shock_dice_weight),
@@ -735,17 +793,20 @@ def _teacher_loss(
     shock_pred: torch.Tensor,
     cp: torch.Tensor,
     shock_target: torch.Tensor,
+    condition_weight: torch.Tensor,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     mask_flat = torch.ones_like(cp)
+    condition_weight = condition_weight.reshape(-1).to(dtype=cp.dtype, device=cp.device)
     cp_weight = (1.0 + float(cfg.expert_shock_weight) * shock_target) * mask_flat
-    cp_loss = _masked_weighted_smooth_l1(cp_pred, cp, cp_weight)
+    cp_loss = _masked_weighted_smooth_l1(cp_pred, cp, cp_weight, sample_weight=condition_weight)
     focal_loss = _masked_focal_bce_with_logits(
         shock_logits,
         shock_target,
         mask_flat,
         cfg.mesh_teacher_shock_focal_gamma,
+        sample_weight=condition_weight,
     )
-    dice_loss = _masked_soft_dice_loss(shock_pred, shock_target, mask_flat)
+    dice_loss = _masked_soft_dice_loss(shock_pred, shock_target, mask_flat, sample_weight=condition_weight)
     shock_loss = (
         float(cfg.mesh_teacher_shock_bce_weight) * focal_loss
         + float(cfg.mesh_teacher_shock_dice_weight) * dice_loss
@@ -756,7 +817,7 @@ def _teacher_loss(
     shock_grid = graph.scatter_tensor(shock_target)
     mask_grid = graph.mask_tensor(device=cp.device).expand(cp.shape[0], -1, -1, -1)
     grad_weight = (1.0 + float(cfg.expert_shock_weight) * shock_grid) * mask_grid
-    grad_loss = _gradient_loss(pred_grid, cp_grid, grad_weight, mask_grid)
+    grad_loss = _gradient_loss(pred_grid, cp_grid, grad_weight, mask_grid, sample_weight=condition_weight)
 
     total = (
         float(cfg.mesh_teacher_cp_loss_weight) * cp_loss
@@ -769,6 +830,7 @@ def _teacher_loss(
         "shock_focal": float(focal_loss.item()),
         "shock_dice": float(dice_loss.item()),
         "grad": float(grad_loss.item()),
+        "condition_weight": float(condition_weight.mean().item()),
     }
 
 
@@ -786,7 +848,8 @@ def _evaluate_teacher(cfg: FullAircraftConfig, graph: CompactSurfaceGraph, model
     n_batches = 0
     model.eval()
     with torch.no_grad():
-        for feat, cp, shock_target in loader:
+        for batch in loader:
+            feat, cp, shock_target = batch[:3]
             feat = feat.to(cfg.device, non_blocking=True)
             cp = cp.to(cfg.device, non_blocking=True)
             shock_target = shock_target.to(cfg.device, non_blocking=True)
@@ -881,7 +944,8 @@ def train_mesh_teacher(cfg: FullAircraftConfig) -> None:
 
     print(
         f"[train-mesh-teacher] train_conditions={len(train_set):,}, test_conditions={len(test_set):,}, "
-        f"nodes={graph.n_points:,}, edges={graph.edge_src.shape[0]:,}, device={cfg.device}"
+        f"nodes={graph.n_points:,}, edges={graph.edge_src.shape[0]:,}, device={cfg.device}, "
+        f"condition_weight_train=[{train_set.condition_weights.min():.2f}, {train_set.condition_weights.max():.2f}]"
     )
 
     for epoch in range(1, cfg.mesh_teacher_epochs + 1):
@@ -889,14 +953,15 @@ def train_mesh_teacher(cfg: FullAircraftConfig) -> None:
         total_objective = 0.0
         total_batches = 0
         pbar = tqdm(train_loader, desc=f"[mesh-teacher] epoch {epoch}/{cfg.mesh_teacher_epochs}")
-        for feat, cp, shock_target in pbar:
+        for feat, cp, shock_target, condition_weight in pbar:
             feat = feat.to(cfg.device, non_blocking=True)
             cp = cp.to(cfg.device, non_blocking=True)
             shock_target = shock_target.to(cfg.device, non_blocking=True)
+            condition_weight = condition_weight.to(cfg.device, non_blocking=True)
             mask_flat = torch.ones_like(cp)
             optimizer.zero_grad(set_to_none=True)
             cp_pred, shock_logits, shock_pred, _ = _forward_teacher(model, feat, edge_src, edge_dst, edge_attr, mask_flat)
-            loss, terms = _teacher_loss(cfg, graph, cp_pred, shock_logits, shock_pred, cp, shock_target)
+            loss, terms = _teacher_loss(cfg, graph, cp_pred, shock_logits, shock_pred, cp, shock_target, condition_weight)
             loss.backward()
             optimizer.step()
             total_objective += float(loss.item())
@@ -906,6 +971,7 @@ def train_mesh_teacher(cfg: FullAircraftConfig) -> None:
                 cp=f"{terms['cp']:.5f}",
                 shock=f"{terms['shock']:.5f}",
                 focal=f"{terms['shock_focal']:.5f}",
+                cw=f"{terms['condition_weight']:.2f}",
             )
         scheduler.step()
         train_objective = total_objective / max(1, total_batches)
@@ -937,6 +1003,21 @@ def train_mesh_teacher(cfg: FullAircraftConfig) -> None:
             "message_passing_steps": int(cfg.mesh_teacher_message_passing_steps),
             "shock_quantile": float(cfg.mesh_teacher_shock_quantile),
             "cfx_weight": float(cfg.mesh_teacher_cfx_weight),
+            "condition_weighting": {
+                "aoa_start": float(cfg.mesh_teacher_condition_weight_aoa_start),
+                "aoa_full": float(cfg.mesh_teacher_condition_weight_aoa_full),
+                "aoa_gain": float(cfg.mesh_teacher_condition_weight_aoa_gain),
+                "transonic_center": float(cfg.mesh_teacher_condition_weight_transonic_center),
+                "transonic_width": float(cfg.mesh_teacher_condition_weight_transonic_width),
+                "transonic_gain": float(cfg.mesh_teacher_condition_weight_transonic_gain),
+                "cap": float(cfg.mesh_teacher_condition_weight_cap),
+                "train_min": float(train_set.condition_weights.min()),
+                "train_mean": float(train_set.condition_weights.mean()),
+                "train_max": float(train_set.condition_weights.max()),
+                "test_min": float(test_set.condition_weights.min()),
+                "test_mean": float(test_set.condition_weights.mean()),
+                "test_max": float(test_set.condition_weights.max()),
+            },
         },
     )
     save_json(_diagnostics_path(cfg, "train"), {"split": "train", **{k: float(v) for k, v in train_diag.items()}})
@@ -992,7 +1073,7 @@ def _build_teacher_shock_array(cfg: FullAircraftConfig, split: str, graph: Compa
     shock = np.zeros((dataset.n_conditions * graph.n_points, 1), dtype=np.float32)
     with torch.no_grad():
         for cond_idx in range(dataset.n_conditions):
-            feat, _, _ = dataset[cond_idx]
+            feat, _, _, _ = dataset[cond_idx]
             feat_t = feat.unsqueeze(0).to(cfg.device, non_blocking=True)
             mask_flat = torch.ones((1, graph.n_points, 1), device=cfg.device, dtype=torch.float32)
             _, _, shock_teacher, _ = _forward_teacher(model, feat_t, edge_src, edge_dst, edge_attr, mask_flat)
@@ -1293,6 +1374,7 @@ def _condition_error_records(
                 "AoA_deg": float(cond[7]),
                 "Pi": float(cond[8]),
                 "regime": _mach_regime(float(cond[6]), cfg),
+                "condition_weight": _condition_difficulty_weight(cond, cfg),
                 "mae": mae,
                 "rmse": rmse,
                 "abs_error_p95": p95,
@@ -1321,6 +1403,7 @@ def _aggregate_condition_records(records: list[dict[str, float | int | str]]) ->
         "smooth_zone_mae_mean": float(np.mean(smooth_maes)) if smooth_maes.size else 0.0,
         "worst_conditions": sorted(records, key=lambda row: float(row["mae"]), reverse=True)[:10],
         "by_regime": {},
+        "by_abs_aoa": {},
     }
     by_regime: dict[str, list[dict[str, float | int | str]]] = {}
     for row in records:
@@ -1333,6 +1416,26 @@ def _aggregate_condition_records(records: list[dict[str, float | int | str]]) ->
         }
         for regime, rows in sorted(by_regime.items())
     }
+    aoa_bins = [
+        ("abs_aoa_lt_8", lambda value: value < 8.0),
+        ("abs_aoa_8_to_12", lambda value: 8.0 <= value < 12.0),
+        ("abs_aoa_ge_12", lambda value: value >= 12.0),
+    ]
+    by_abs_aoa: dict[str, object] = {}
+    for name, predicate in aoa_bins:
+        rows = [row for row in records if predicate(abs(float(row["AoA_deg"])))]
+        if not rows:
+            continue
+        shock_rows = [row for row in rows if float(row["shock_fraction"]) > 0.0]
+        by_abs_aoa[name] = {
+            "conditions": int(len(rows)),
+            "mae_mean": float(np.mean([float(row["mae"]) for row in rows])),
+            "mae_max": float(np.max([float(row["mae"]) for row in rows])),
+            "shock_zone_mae_mean": float(np.mean([float(row["shock_zone_mae"]) for row in shock_rows])) if shock_rows else 0.0,
+            "smooth_zone_mae_mean": float(np.mean([float(row["smooth_zone_mae"]) for row in rows])),
+            "condition_weight_mean": float(np.mean([float(row["condition_weight"]) for row in rows])),
+        }
+    payload["by_abs_aoa"] = by_abs_aoa
     return payload
 
 

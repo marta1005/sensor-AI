@@ -947,14 +947,22 @@ def train_mesh_teacher(cfg: FullAircraftConfig) -> None:
 
 def _load_mesh_teacher(cfg: FullAircraftConfig) -> FullAircraftMeshTeacher:
     config = json.loads(_model_config_path(cfg).read_text())
+    state = torch.load(_model_path(cfg), map_location="cpu")
     architecture = str(config.get("architecture", "mesh_teacher_v1"))
     supported = {"mesh_teacher_cp_shock_v3", "mesh_teacher_cp_shock_residual_v4"}
     if architecture not in supported:
-        raise ValueError(
-            f"Stored mesh teacher architecture is {architecture!r}, but the current pipeline expects "
-            f"one of {sorted(supported)}. Re-run 'train-mesh-teacher' before distilling or inferring."
-        )
-    use_shock_residual = bool(config.get("use_shock_residual", architecture == "mesh_teacher_cp_shock_residual_v4"))
+        cp_head_out = int(state["cp_head.2.weight"].shape[0]) if "cp_head.2.weight" in state else 0
+        if cp_head_out == 2:
+            architecture = "mesh_teacher_cp_shock_residual_v4"
+        elif cp_head_out == 1:
+            architecture = "mesh_teacher_cp_shock_v3"
+        else:
+            raise ValueError(
+                f"Stored mesh teacher architecture is {architecture!r}, and the checkpoint keys do not match "
+                f"the current mesh teacher. Re-run 'train-mesh-teacher' before distilling or inferring."
+            )
+    cp_head_out = int(state["cp_head.2.weight"].shape[0]) if "cp_head.2.weight" in state else 0
+    use_shock_residual = bool(config.get("use_shock_residual", architecture == "mesh_teacher_cp_shock_residual_v4" or cp_head_out == 2))
     model = FullAircraftMeshTeacher(
         input_dim=int(config["input_dim"]),
         hidden_dim=int(config["hidden_dim"]),
@@ -963,7 +971,6 @@ def _load_mesh_teacher(cfg: FullAircraftConfig) -> FullAircraftMeshTeacher:
         dropout=float(config.get("dropout", cfg.mesh_teacher_dropout)),
         use_shock_residual=use_shock_residual,
     )
-    state = torch.load(_model_path(cfg), map_location="cpu")
     model.load_state_dict(state)
     try:
         model.to(cfg.device)
